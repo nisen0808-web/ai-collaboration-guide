@@ -12,6 +12,13 @@ _OTHER_KEYS = ("hooks", "plugins", "mcpServers", "lspServers", "projectInstructi
 # absent key supports older inspect versions; a present key must be an empty
 # list. Built-in agents have a separate caller-confirmed restriction below.
 _EXTRA_EXTENSION_KEYS = ("marketplaces", "experiments")
+# Only these fixed, path-free codes may be passed to the coordinator.
+INSPECTION_REASONS = frozenset({
+    "inspection_format_unknown", "extensions_present_or_unknown",
+    "skills_present_or_unknown", "agents_present_or_unknown",
+    "subagents_disable_unverified", "agent_state_conflict_or_unknown",
+    "metadata_format_unknown", "unknown_nonempty_container",
+})
 # Known top-level report metadata. Its contents are not evidence that any
 # extension is disabled; callers must retain the unverified flag below.
 _METADATA_DICT_KEYS = frozenset({"configSources", "externalCompat",

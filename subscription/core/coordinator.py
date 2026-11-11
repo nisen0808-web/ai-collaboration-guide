@@ -42,6 +42,12 @@ POLL_ERRORS = frozenset({
     "worker_error", "worker_identity_unconfirmed", "worker_start_unconfirmed",
     "worker_request_invalid", "dispatch_interrupted", "state_write_failed",
 })
+INSPECTION_REASONS = frozenset({
+    "inspection_format_unknown", "extensions_present_or_unknown",
+    "skills_present_or_unknown", "agents_present_or_unknown",
+    "subagents_disable_unverified", "agent_state_conflict_or_unknown",
+    "metadata_format_unknown", "unknown_nonempty_container",
+})
 
 
 def _canonical(value: dict) -> str:
@@ -333,6 +339,11 @@ class Coordinator:
         # Only accept known fixed codes, never arbitrary provider diagnostics.
         if isinstance(error, str) and error in POLL_ERRORS:
             result["error"] = error
+        inspection_reason = response.get("inspection_reason")
+        if (provider == "grok" and actual == "failed" and
+                error == "unexpected_or_unknown_extensions" and
+                isinstance(inspection_reason, str) and inspection_reason in INSPECTION_REASONS):
+            result["inspection_reason"] = inspection_reason
         # Raw provider metadata can contain paths or credentials. Return a
         # deliberately small set of primitive verification fields only.
         quality = response.get("quality_verification")

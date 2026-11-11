@@ -17,9 +17,9 @@ import threading
 import uuid
 
 if __package__:
-    from .inspect_policy import inspect_report_diagnostics
+    from .inspect_policy import INSPECTION_REASONS, inspect_report_diagnostics
 else:
-    from inspect_policy import inspect_report_diagnostics
+    from inspect_policy import INSPECTION_REASONS, inspect_report_diagnostics
 
 
 _NETWORK_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
@@ -188,7 +188,13 @@ class GrokAdapter:
             diagnostics = inspect_report_diagnostics(
                 report, subagents_disabled=env.get("GROK_SUBAGENTS") == "0" and "--no-subagents" in argv)
             if not diagnostics["allowed"]:
-                self._update(job_id, status="failed", error="unexpected_or_unknown_extensions", submitted=False)
+                # Never expose the inspection report, skill names, paths, or
+                # arbitrary diagnostics: only fixed, path-free categories.
+                reason = diagnostics.get("reason")
+                fields = {"status": "failed", "error": "unexpected_or_unknown_extensions", "submitted": False}
+                if isinstance(reason, str) and reason in INSPECTION_REASONS:
+                    fields["inspection_reason"] = reason
+                self._update(job_id, **fields)
                 return
             self._update(job_id, inspection_metadata_unverified=diagnostics["unverified_metadata"])
             # Windows ACLs inherit from temp directory: do not claim Unix mode

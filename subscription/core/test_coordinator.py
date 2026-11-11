@@ -588,6 +588,66 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         self.assertEqual(c.result("claude", "key")["output"], "complete")
         self.assertEqual(adapter.submits, 1)
 
+    def test_actual_grok_preflight_category_round_trips_without_report_content(self):
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from grok import grok_adapter
+            root = Path(self.tmp.name)
+            cli = root / "synthetic-client"
+            profile = root / "synthetic-profile"
+            cli.touch()
+            profile.mkdir()
+            adapter = grok_adapter.GrokAdapter(str(cli), "synthetic-model", "medium", str(profile))
+            report = {key: [] for key in grok_adapter._INSPECT_KEYS}
+            report["skills"] = [{"name": "private-skill-name", "source": {"path": "C:/private/profile"}}]
+            coordinator = Coordinator(self.db, {"grok": adapter})
+            with patch.object(grok_adapter.subprocess, "run", return_value=Mock(returncode=0, stdout=json.dumps(report).encode())), \
+                 patch.object(grok_adapter.subprocess, "Popen", side_effect=AssertionError("must not start")) as launch:
+                coordinator.submit("grok", "synthetic task", "request-key")
+                response = {}
+                for _ in range(300):
+                    response = coordinator.result("grok", "request-key")
+                    if response.get("status") == "failed":
+                        break
+                    threading.Event().wait(0.01)
+                self.assertEqual(response.get("status"), "failed")
+                self.assertEqual(response.get("inspection_reason"), "skills_present_or_unknown")
+                self.assertNotIn("private", repr(response))
+                launch.assert_not_called()
+        finally:
+            sys.path.remove(package_root)
+
+    def test_grok_preflight_category_is_fixed_and_other_provider_continues(self):
+        class Adapter:
+            def __init__(self, reason, error="unexpected_or_unknown_extensions"):
+                self.reason = reason
+                self.error = error
+            def submit(self, **kw):
+                return {"status": "queued", "job_id": "job-1"}
+            def poll(self, job_id):
+                return {"status": "failed", "error": self.error, "inspection_reason": self.reason}
+
+        class Other:
+            def submit(self, **kw):
+                return {"status": "queued", "job_id": "job-2"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "independent answer"}
+
+        adapter = Adapter("skills_present_or_unknown")
+        c = Coordinator(self.db, {"grok": adapter, "claude": Other()})
+        c.submit("grok", "task", "grok-key")
+        self.assertEqual(c.result("grok", "grok-key")["inspection_reason"], "skills_present_or_unknown")
+        c.submit("claude", "independent task", "claude-key")
+        self.assertEqual(c.result("claude", "claude-key")["output"], "independent answer")
+        adapter.reason = "C:/private-profile/secret"
+        leaked = c.result("grok", "grok-key")
+        self.assertNotIn("inspection_reason", leaked)
+        self.assertNotIn("private-profile", repr(leaked))
+        adapter.reason = "skills_present_or_unknown"
+        adapter.error = "other-error"
+        self.assertNotIn("inspection_reason", c.result("grok", "grok-key"))
+
     def test_truncated_success_is_incomplete_with_original_execution_status(self):
         class Adapter:
             def __init__(self): self.submits = 0

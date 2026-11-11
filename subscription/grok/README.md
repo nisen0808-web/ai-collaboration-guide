@@ -41,6 +41,19 @@ not been checked. This does not establish privacy, billing or cross-platform
 compatibility. Do not use this candidate for real tasks until it has been
 independently reviewed.
 
+An inspection rejection retains the existing fixed error
+`unexpected_or_unknown_extensions` and can additionally expose a fixed,
+path-free `inspection_reason` such as `skills_present_or_unknown` or
+`extensions_present_or_unknown`. It does not disclose skill names, paths, or
+the inspection report. A missing disable marker is not proof a skill ran.
+Users may separately configure `[skills].disabled` only in their own dedicated
+profile and check that the official `inspect --json` reports `disabled: true`;
+see the [official skills guide](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/08-skills.md).
+The tool does not automatically change an existing or shared profile, and an
+inspection snapshot cannot rule out later configuration changes. Other or
+unknown extensions remain blocked; an original failed or uncertain task is
+never automatically resent.
+
 `durable_grok.py` provides a separate detached-worker candidate using an
 explicit, existing tool-owned state directory. It reserves each task in SQLite
 before launching, runs one child worker, and can query the original job ID after

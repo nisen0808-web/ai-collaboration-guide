@@ -116,6 +116,39 @@ class AdapterTests(unittest.TestCase):
                 self.assertFalse(state["submitted"])
                 self.available(2)
 
+    def test_preflight_exposes_only_fixed_category_not_report_content(self):
+        cases = (
+            (dict(self.report, skills=[{"name": "private-skill-name", "source": {"path": "C:/private/profile"}}]),
+             "skills_present_or_unknown"),
+            (dict(self.report, plugins=[{"name": "private-plugin-name"}]),
+             "extensions_present_or_unknown"),
+        )
+        for index, (report, expected) in enumerate(cases):
+            with self.subTest(expected=expected), \
+                 mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(report).encode())), \
+                 mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("must not start")) as launched:
+                result = self.instance.submit("synthetic task", f"diagnostic-{index}")
+                state = self.completed(result["job_id"])
+                self.assertEqual(state["status"], "failed")
+                self.assertEqual(state["error"], "unexpected_or_unknown_extensions")
+                self.assertEqual(state["inspection_reason"], expected)
+                self.assertNotIn("private", repr(state))
+                self.assertFalse(state["submitted"])
+                launched.assert_not_called()
+                self.available(2)
+
+    def test_unknown_preflight_reason_is_not_forwarded(self):
+        diagnostics = {"allowed": False, "reason": "private-skill-name", "unverified_metadata": True}
+        with mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=b'{}')), \
+             mock.patch.object(subject, "inspect_report_diagnostics", return_value=diagnostics), \
+             mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("must not start")) as launched:
+            result = self.instance.submit("synthetic task", "unknown-diagnostic")
+            state = self.completed(result["job_id"])
+            self.assertEqual(state["error"], "unexpected_or_unknown_extensions")
+            self.assertNotIn("inspection_reason", state)
+            self.assertNotIn("private", repr(state))
+            launched.assert_not_called()
+
     def test_explicitly_disabled_synthetic_skill_does_not_block(self):
         report = dict(self.report, skills=[{"name": "synthetic", "enabled": False}])
         with mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(report).encode())), \
