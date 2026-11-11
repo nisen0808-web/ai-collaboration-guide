@@ -254,10 +254,7 @@ def safe_http_error_type(error, provider):
     may come from intermediaries, so type is a reported label, not proof of cause.
     """
     allow = {
-        "claude": frozenset({"invalid_request_error", "authentication_error", "billing_error",
-                            "permission_error", "not_found_error", "conflict_error",
-                            "request_too_large", "rate_limit_error", "api_error",
-                            "timeout_error", "overloaded_error"}),
+        "claude": frozenset({"invalid_request_error"}),
         "grok": frozenset({"invalid_request_error"}),
     }
     if error.code != 400 or provider not in allow:

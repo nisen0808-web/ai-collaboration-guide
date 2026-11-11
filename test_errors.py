@@ -29,6 +29,15 @@ class ErrorClassificationTests(unittest.TestCase):
                 self.assertNotIn("secret", json.dumps(result))
                 self.assertNotIn("fake-key", json.dumps(result))
 
+    def test_conflicting_http_400_error_types_are_not_reported(self):
+        for kind in ("authentication_error", "billing_error", "rate_limit_error", "overloaded_error"):
+            with self.subTest(kind=kind):
+                body = io.BytesIO(json.dumps({"error": {"type": kind, "message": "secret"}}).encode())
+                result = self.run_error("claude", 400, body)
+                self.assertEqual(result["status"], "failed")
+                self.assertNotIn("error_type", result)
+                self.assertNotIn("secret", json.dumps(result))
+
     def test_unknown_malformed_and_oversize_body_are_not_exposed(self):
         cases = [b'{"error":{"type":"fake-key","message":"secret"}}',
                  b'not-json-secret', b'{"error":{"type":[]}}',
