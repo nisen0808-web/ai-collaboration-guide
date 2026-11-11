@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import queue
 import subprocess
@@ -7,7 +8,7 @@ import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from coordinator import Coordinator, InputError, POLL_ERRORS, SUBMIT_REASONS
 
@@ -165,6 +166,83 @@ class LedgerTests(unittest.TestCase):
         with patch("coordinator._proved_grok_prelaunch_abort", side_effect=concurrent_success):
             coordinator.result("grok", "request-key")
         self.assertEqual(coordinator.get("request-key")["status"], "succeeded")
+
+    def test_corrupt_grok_states_do_not_become_coordinator_success_or_release(self):
+        # The adapter and coordinator are real, but the only spawned process
+        # is mocked. Each case has a separate synthetic SQLite ledger.
+        root = Path(self.tmp.name)
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from grok import durable_grok
+            cases = (("not_submitted", "succeeded"),
+                     ("not_submitted", "failed"),
+                     (durable_grok._PRELAUNCH_ABORTED, "succeeded"),
+                     (durable_grok._PRELAUNCH_ABORTED, "failed"),
+                     ("synthetic_unknown_state", "succeeded"),
+                     ("finished_uncertain", "succeeded"),
+                     ("succeeded", "failed"),
+                     ("running", "succeeded"))
+            for index, (durable_state, payload_status) in enumerate(cases):
+                with self.subTest(state=durable_state, payload=payload_status):
+                    case = root / str(index)
+                    state, profile, cli = case / "state", case / "profile", case / "synthetic-cli"
+                    state.mkdir(parents=True)
+                    profile.mkdir()
+                    cli.touch()
+                    adapter = durable_grok.DurableGrokAdapter(str(cli), "synthetic-model", "medium",
+                                                               str(profile), str(state), max_concurrency=1)
+                    coordinator = Coordinator(case / "coord.db", {"grok": adapter})
+                    with patch.object(durable_grok.subprocess, "Popen", return_value=Mock(pid=123)) as launch:
+                        receipt = coordinator.submit("grok", "synthetic task", "original-key")
+                        job_id = receipt["job_id"]
+                        payload = {"status": payload_status, "job_id": job_id, "output": "synthetic result"}
+                        with adapter.ledger._connect() as con:
+                            con.execute("UPDATE jobs SET state=?,result_json=? WHERE job_id=?",
+                                        (durable_state, json.dumps(payload), job_id))
+                            if durable_state == "running":
+                                con.execute("UPDATE jobs SET worker_pid=?,worker_identity=? WHERE job_id=?",
+                                            (123, "synthetic-identity", job_id))
+                        with patch.object(durable_grok, "_process_identity", return_value="synthetic-identity"):
+                            result = coordinator.result("grok", "original-key")
+                        self.assertEqual(result["status"], "submission_uncertain")
+                        self.assertEqual(result["job_id"], job_id)
+                        self.assertNotIn("output", result)
+                        self.assertEqual(coordinator.get("original-key")["status"], "submission_uncertain")
+                        replay = coordinator.submit("grok", "synthetic task", "original-key")
+                        self.assertTrue(replay["replayed"])
+                        self.assertEqual(replay["job_id"], job_id)
+                        self.assertEqual(adapter.status()["local_available_slots"], 0)
+                        self.assertEqual(adapter.submit("other task", "other-id")["reason"], "provider_busy")
+                        self.assertEqual(launch.call_count, 1)
+        finally:
+            sys.path.remove(package_root)
+
+    def test_coordinator_preserves_legitimate_grok_success(self):
+        root = Path(self.tmp.name)
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from grok import durable_grok
+            state, profile, cli = root / "state", root / "profile", root / "synthetic-cli"
+            state.mkdir()
+            profile.mkdir()
+            cli.touch()
+            adapter = durable_grok.DurableGrokAdapter(str(cli), "synthetic-model", "medium",
+                                                       str(profile), str(state), max_concurrency=1)
+            coordinator = Coordinator(self.db, {"grok": adapter})
+            with patch.object(durable_grok.subprocess, "Popen", return_value=Mock(pid=123)) as launch:
+                receipt = coordinator.submit("grok", "synthetic task", "original-key")
+                job_id = receipt["job_id"]
+                self.assertTrue(adapter.ledger.claim(job_id))
+                adapter.ledger.store(job_id, {"status": "succeeded", "job_id": job_id, "output": "42"})
+                result = coordinator.result("grok", "original-key")
+                self.assertEqual(result["status"], "succeeded")
+                self.assertEqual(result["output"], "42")
+                self.assertEqual(adapter.status()["local_available_slots"], 1)
+                self.assertEqual(launch.call_count, 1)
+        finally:
+            sys.path.remove(package_root)
 
     def test_replay_never_dispatches_again(self):
         calls = []

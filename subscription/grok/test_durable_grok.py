@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest import mock
@@ -283,6 +284,71 @@ class DurableTests(unittest.TestCase):
                             (json.dumps({"status":"not_submitted","job_id":job_id,"reason":"state_write_failed"}), job_id))
             self.assertEqual(adapter.status()["local_available_slots"], 1)
             launch.assert_not_called()
+
+    def test_damaged_state_or_body_never_fabricates_terminal_or_frees_slot(self):
+        adapter = self.adapter()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)) as launch:
+            receipt = adapter.submit("synthetic task", "task-1")
+            job_id = receipt["job_id"]
+            cases = (
+                ("not_submitted", {"status": "succeeded", "job_id": job_id, "output": "forged"}),
+                ("not_submitted", {"status": "failed", "job_id": job_id}),
+                (subject._PRELAUNCH_ABORTED, {"status": "succeeded", "job_id": job_id, "output": "forged"}),
+                (subject._PRELAUNCH_ABORTED, {"status": "failed", "job_id": job_id}),
+                ("unknown_future_state", {"status": "succeeded", "job_id": job_id, "output": "forged"}),
+                ("running", {"status": "succeeded", "job_id": job_id, "output": "forged"}),
+                ("succeeded", {"status": "running", "job_id": job_id}),
+                ("finished_uncertain", {"status": "submission_uncertain", "job_id": job_id}),
+                ("failed", ["not", "a", "record"]),
+            )
+            for state, body in cases:
+                with self.subTest(state=state, body_type=type(body).__name__):
+                    with adapter.ledger._connect() as con:
+                        con.execute("UPDATE jobs SET state=?,result_json=?,worker_pid=NULL,worker_identity=NULL "
+                                    "WHERE job_id=?", (state, json.dumps(body), job_id))
+                    self.assertEqual(adapter.poll(job_id)["status"], "submission_uncertain")
+                    self.assertEqual(adapter.status()["local_available_slots"], 0)
+                    self.assertEqual(adapter.status()["local_finished_unresolved"], 0)
+                    replay = adapter.submit("synthetic task", "task-1")
+                    self.assertEqual(replay["status"], "submission_uncertain")
+                    self.assertEqual(replay["job_id"], job_id)
+                    self.assertEqual(adapter.submit("different task", "task-2")["reason"], "provider_busy")
+                    self.assertEqual(launch.call_count, 1)
+            # A consistent, genuine terminal state is unaffected.
+            adapter.ledger.store(job_id, {"status": "succeeded", "job_id": job_id, "output": "valid"})
+            self.assertEqual(adapter.poll(job_id)["output"], "valid")
+            self.assertEqual(adapter.status()["local_available_slots"], 1)
+
+    def test_claim_and_prelaunch_abort_are_atomic_between_connections(self):
+        adapter = self.adapter()
+        _, job_id = adapter.ledger.reserve("task-1", "synthetic-digest", 1)
+        barrier = threading.Barrier(2)
+        results = {}
+        errors = []
+        def run(name, action):
+            try:
+                barrier.wait(timeout=5)
+                results[name] = action(job_id)
+            except Exception as exc:
+                errors.append(exc)
+        threads = [threading.Thread(target=run, args=("claim", adapter.ledger.claim)),
+                   threading.Thread(target=run, args=("abort", adapter.ledger.finish_known_unstarted))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=10)
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(set(results), {"claim", "abort"})
+        self.assertNotEqual(results["claim"], results["abort"])
+        job = adapter.ledger.get(job_id)
+        if results["claim"]:
+            self.assertEqual(job.state, "queued")
+            self.assertEqual(adapter.status()["local_available_slots"], 0)
+        else:
+            self.assertEqual(job.state, subject._PRELAUNCH_ABORTED)
+            self.assertEqual(adapter.poll(job_id)["status"], "not_submitted")
+            self.assertEqual(adapter.status()["local_available_slots"], 1)
 
     def test_confirmed_exit_retains_uncertain_partial_and_frees_only_local_slot(self):
         adapter = self.adapter()

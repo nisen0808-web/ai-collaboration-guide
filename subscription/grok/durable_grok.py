@@ -33,6 +33,7 @@ else:
 # identity fields are empty. New proven failures use _PRELAUNCH_ABORTED.
 _ACTIVE = ("dispatching", "queued", "running", "submission_uncertain", "not_submitted")
 _PRELAUNCH_ABORTED = "prelaunch_aborted_v1"
+_TERMINAL = ("succeeded", "failed")
 _SCHEMA = """CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY, task_key TEXT NOT NULL UNIQUE,
     task_digest TEXT NOT NULL, state TEXT NOT NULL,
@@ -92,7 +93,34 @@ class _StoredJob:
     state: str
     worker_pid: int | None
     worker_identity: str | None
-    result: dict
+    result: object
+
+
+def _consistent_record(job_id: str, state: str, worker_pid: int | None,
+                       worker_identity: str | None, result: object) -> bool:
+    """Validate the local state/result pairing before releasing or reporting it.
+
+    A record with an unknown state, malformed body or conflicting status is not
+    evidence of a finished process. This check does not infer remote outcome.
+    """
+    if not _valid_id(job_id) or not isinstance(result, dict) or result.get("job_id") != job_id:
+        return False
+    status = result.get("status")
+    if state == _PRELAUNCH_ABORTED:
+        return (worker_pid is None and worker_identity is None and
+                result == {"status": "not_submitted", "job_id": job_id, "reason": "state_write_failed"})
+    if state == "not_submitted":
+        return False  # Legacy generic terminal is never proof of no launch.
+    if state == "dispatching":
+        return status == "submission_uncertain"
+    if state == "queued":
+        # claim() sets queued before the worker writes its first update.
+        return status in ("queued", "submission_uncertain")
+    if state in ("running", "submission_uncertain"):
+        return status == state
+    if state == "finished_uncertain":
+        return status == "submission_uncertain" and result.get("local_exit_confirmed") is True
+    return state in _TERMINAL and status == state
 
 
 class _Ledger:
@@ -224,22 +252,19 @@ class _Ledger:
 
     @staticmethod
     def _active_rows(con: sqlite3.Connection) -> list[sqlite3.Row]:
-        placeholders = ",".join("?" for _ in _ACTIVE)
-        rows = con.execute(f"SELECT job_id,state,worker_pid,worker_identity,result_json FROM jobs "
-                           f"WHERE state IN ({placeholders}) OR state=?",
-                           (*_ACTIVE, _PRELAUNCH_ABORTED)).fetchall()
+        # Inspect all persisted state names: unknown or contradictory rows must
+        # not be silently excluded from the local concurrency limit.
+        rows = con.execute("SELECT job_id,state,worker_pid,worker_identity,result_json FROM jobs").fetchall()
         active = []
         for row in rows:
-            if row["state"] == _PRELAUNCH_ABORTED:
-                try:
-                    expected = {"status": "not_submitted", "job_id": row["job_id"], "reason": "state_write_failed"}
-                    valid = (_valid_id(row["job_id"]) and row["worker_pid"] is None and row["worker_identity"] is None
-                             and json.loads(row["result_json"]) == expected)
-                except (ValueError, TypeError):
-                    valid = False
-                if valid:
-                    continue
-            active.append(row)
+            try:
+                result = json.loads(row["result_json"])
+                consistent = _consistent_record(row["job_id"], row["state"], row["worker_pid"],
+                                                row["worker_identity"], result)
+            except (ValueError, TypeError):
+                consistent = False
+            if row["state"] in _ACTIVE or not consistent:
+                active.append(row)
         return active
 
     def find_job(self, task_id: str) -> str | None:
@@ -405,12 +430,9 @@ class DurableGrokAdapter:
             job = None
         if job is None:
             return {"status": "submission_uncertain", "job_id": job_id, "error": "job_state_unavailable"}
-        if job.result.get("status") == "not_submitted":
-            expected = {"status": "not_submitted", "job_id": job_id, "reason": "state_write_failed"}
-            if (job.state != _PRELAUNCH_ABORTED or job.worker_pid is not None
-                    or job.worker_identity is not None or job.result != expected):
-                return {"status": "submission_uncertain", "job_id": job_id,
-                        "error": "worker_start_unconfirmed"}
+        if not _consistent_record(job_id, job.state, job.worker_pid, job.worker_identity, job.result):
+            return {"status": "submission_uncertain", "job_id": job_id,
+                    "error": "worker_start_unconfirmed"}
         if job.state in {"dispatching", "queued", "running"}:
             if not job.worker_identity or _process_identity(job.worker_pid) != job.worker_identity:
                 return {"status": "submission_uncertain", "job_id": job_id, "error": "worker_identity_unconfirmed"}
@@ -421,7 +443,16 @@ class DurableGrokAdapter:
         observed, uncertain = self.ledger.occupancy()
         active = observed + uncertain
         with self.ledger._connect() as con:
-            finished_unresolved = con.execute("SELECT COUNT(*) FROM jobs WHERE state='finished_uncertain'").fetchone()[0]
+            rows = con.execute("SELECT job_id,state,worker_pid,worker_identity,result_json FROM jobs "
+                               "WHERE state='finished_uncertain'").fetchall()
+        finished_unresolved = 0
+        for row in rows:
+            try:
+                result = json.loads(row["result_json"])
+                if _consistent_record(row["job_id"], row["state"], row["worker_pid"], row["worker_identity"], result):
+                    finished_unresolved += 1
+            except (ValueError, TypeError):
+                continue  # Corrupt rows remain part of uncertain occupancy.
         return {"provider": "grok", "local_active_jobs": active, "local_max_concurrency": self.max_concurrency,
                 "local_observed_inflight": observed, "local_uncertain": uncertain,
                 "local_finished_unresolved": finished_unresolved,

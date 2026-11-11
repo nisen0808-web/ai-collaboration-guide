@@ -77,3 +77,7 @@ be safely distinguished from that race from the row alone; old rows are not
 changed or automatically released. Enough such rows can leave Grok locally
 busy, and the current candidate does not provide an automatic reconciliation
 command for them. Other providers can continue independently.
+
+To avoid treating corrupt or unknown ledger records as finished, capacity
+checks validate the local job history. This has not been load-tested with a
+large ledger, and checks may slow as that history grows.
