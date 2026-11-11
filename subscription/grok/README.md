@@ -32,15 +32,15 @@ In-memory job tracking is lost when the hosting process exits and unknown jobs
 remain uncertain. There is no automatic process kill or retry. One official
 CLI version's help and a read-only inspection have been checked on Windows.
 One short real task returned the expected answer. After subsequent code changes,
-an attempted task stopped at preflight without a model request because bundled
-skills were not explicitly disabled. A different new task then returned the
+an attempted task stopped at preflight without a model request; a subsequent
+inspection found bundled skills not explicitly disabled. A different new task then returned the
 expected answer after those skills were disabled in an exclusive test profile.
 The latest exact official session summary and usage records together reported
 `grok-4.7`, `grok-4.7-build`, and `xhigh`.
 The coordinator separately checked these records against its quality policy;
 this candidate still reports quality as unverified and cannot perform that
 check automatically. The damaged-ledger recovery paths were tested offline;
-the successful new task did not exercise those paths. Other CLI versions
+this successful task does not establish their behavior. Other CLI versions
 have not been checked. This does not establish privacy, billing or cross-platform
 compatibility. Do not use this candidate for real tasks until it has been
 independently reviewed.
