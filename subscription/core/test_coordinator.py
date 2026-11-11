@@ -618,6 +618,71 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         finally:
             sys.path.remove(package_root)
 
+    def test_durable_grok_preflight_diagnostic_survives_worker_and_coordinator_restart(self):
+        # Spawn only a synthetic Python worker. Its fake inspect contains
+        # private-looking placeholders, and its provider-launch stub fails if
+        # invoked. No official client, login, or network is used.
+        root = Path(self.tmp.name)
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from grok import durable_grok
+            state, profile, cli = root / "grok-state", root / "grok-profile", root / "synthetic-grok"
+            state.mkdir()
+            profile.mkdir()
+            cli.touch()
+            marker = root / "provider-launch-attempted"
+            fake_worker = root / "fake_preflight_worker.py"
+            fake_worker.write_text('''import json, sys\nfrom pathlib import Path\nfrom types import SimpleNamespace\nsys.path.insert(0, sys.argv[1])\nfrom grok import durable_grok, grok_adapter\nreport = {key: [] for key in grok_adapter._INSPECT_KEYS}\nreport["skills"] = [{"name":"private-skill-name", "source":{"path":"C:/private/profile"}}]\ndef fake_inspect(*args, **kwargs):\n    return SimpleNamespace(returncode=0, stdout=json.dumps(report).encode())\ndef forbidden_launch(*args, **kwargs):\n    Path(sys.argv[4]).touch()\n    raise AssertionError("provider launch is forbidden")\ngrok_adapter.subprocess.run = fake_inspect\ngrok_adapter.subprocess.Popen = forbidden_launch\nraise SystemExit(durable_grok.worker_main(sys.argv[2], sys.argv[3]))\n''', encoding="utf-8")
+
+            def fake_command(work_root, job_id):
+                return [sys.executable, str(fake_worker), package_root, str(work_root), job_id, str(marker)]
+
+            adapter = durable_grok.DurableGrokAdapter(str(cli), "synthetic-model", "medium",
+                                                       str(profile), str(state), max_concurrency=1)
+            coordinator = Coordinator(self.db, {"grok": adapter})
+            spawned = []
+            real_popen = subprocess.Popen
+            def start_worker(*args, **kwargs):
+                child = real_popen(*args, **kwargs)
+                spawned.append(child)
+                return child
+
+            with patch.object(durable_grok, "_worker_command", side_effect=fake_command), \
+                 patch.object(durable_grok.subprocess, "Popen", side_effect=start_worker) as launch:
+                submitted = coordinator.submit("grok", "synthetic task", "grok-key")
+                self.assertEqual(submitted["status"], "queued")
+                self.assertEqual(len(spawned), 1)
+                self.assertEqual(spawned[0].wait(timeout=10), 0)
+                self.assertEqual(launch.call_count, 1)
+            self.assertFalse(marker.exists())
+
+            class Other:
+                def submit(self, **kwargs):
+                    return {"status": "queued", "job_id": "synthetic-other-job"}
+                def poll(self, job_id):
+                    return {"status": "succeeded", "output": "independent answer"}
+
+            restored_adapter = durable_grok.DurableGrokAdapter(str(cli), "synthetic-model", "medium",
+                                                                str(profile), str(state), max_concurrency=1)
+            restored = Coordinator(self.db, {"grok": restored_adapter, "claude": Other()})
+            with patch.object(durable_grok.subprocess, "Popen", side_effect=AssertionError("must not resend")) as launch:
+                result = restored.result("grok", "grok-key")
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["error"], "unexpected_or_unknown_extensions")
+                self.assertEqual(result["inspection_reason"], "skills_present_or_unknown")
+                self.assertNotIn("private", repr(result))
+                replay = restored.submit("grok", "synthetic task", "grok-key")
+                self.assertTrue(replay["replayed"])
+                self.assertEqual(replay["job_id"], submitted["job_id"])
+                self.assertEqual(restored_adapter.status()["local_available_slots"], 1)
+                restored.submit("claude", "independent task", "claude-key")
+                self.assertEqual(restored.result("claude", "claude-key")["output"], "independent answer")
+                launch.assert_not_called()
+            self.assertFalse(marker.exists())
+        finally:
+            sys.path.remove(package_root)
+
     def test_grok_preflight_category_is_fixed_and_other_provider_continues(self):
         class Adapter:
             def __init__(self, reason, error="unexpected_or_unknown_extensions"):
