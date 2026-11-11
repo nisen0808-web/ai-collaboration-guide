@@ -21,6 +21,7 @@ from pathlib import Path
 
 MAX_TASK_CHARS = 20000
 MAX_RESPONSE_BYTES = 2097152
+MAX_ERROR_BYTES = 16384
 MODEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
@@ -246,6 +247,34 @@ def parse_response(provider, data):
     return result["output"]
 
 
+def safe_http_error_type(error, provider):
+    """Read at most 16 KiB of a 400 JSON body; return only a fixed, known type.
+
+    The provider message and arbitrary fields are never returned. HTTP errors
+    may come from intermediaries, so type is a reported label, not proof of cause.
+    """
+    allow = {
+        "claude": frozenset({"invalid_request_error", "authentication_error", "billing_error",
+                            "permission_error", "not_found_error", "conflict_error",
+                            "request_too_large", "rate_limit_error", "api_error",
+                            "timeout_error", "overloaded_error"}),
+        "grok": frozenset({"invalid_request_error"}),
+    }
+    if error.code != 400 or provider not in allow:
+        return None
+    try:
+        raw = error.read(MAX_ERROR_BYTES + 1)
+        if not isinstance(raw, bytes) or len(raw) > MAX_ERROR_BYTES:
+            return None
+        body = json.loads(raw.decode("utf-8", errors="strict"))
+        details = body.get("error") if isinstance(body, dict) else None
+        candidate = details.get("type") if isinstance(details, dict) else None
+        return candidate if isinstance(candidate, str) and candidate in allow[provider] else None
+    except Exception:
+        # Error body is untrusted and optional; never expose it or its exceptions.
+        return None
+
+
 def run_provider(provider, prompt, model, key, timeout, max_tokens):
     if not key or not model:
         return {"status": "not_submitted", "reason": "missing_credential_or_model"}
@@ -268,8 +297,12 @@ def run_provider(provider, prompt, model, key, timeout, max_tokens):
     except urllib.error.HTTPError as error:
         # Do not print server error bodies: they may contain user data or tokens.
         status = "submission_uncertain" if error.code == 408 or error.code >= 500 else "failed"
-        return {"status": status, "reason": "http_error", "http_status": error.code,
-                "request_id": response_request_id(error.headers), "retry": "not_attempted"}
+        result = {"status": status, "reason": "http_error", "http_status": error.code,
+                  "request_id": response_request_id(error.headers), "retry": "not_attempted"}
+        error_type = safe_http_error_type(error, provider)
+        if error_type is not None:
+            result["error_type"] = error_type
+        return result
     except InvalidProviderResponse as error:
         return {"status": "invalid_response", "reason": error.reason,
                 "request_id": safe_identifier(error.request_id), "retry": "not_attempted"}
@@ -284,10 +317,11 @@ def run_provider(provider, prompt, model, key, timeout, max_tokens):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Independent Claude and Grok API calls; may incur charges.")
-    parser.add_argument("--confirm-paid", action="store_true", help="Authorize sending stdin to both paid API services")
+    parser.add_argument("--confirm-paid", action="store_true", help="Confirm sending the task to both paid API services")
     parser.add_argument("--ask-keys", action="store_true", help="Read keys with hidden input from an interactive terminal")
     parser.add_argument("--task-file", help="Read the task from a UTF-8 file")
     parser.add_argument("--stdin-utf8", action="store_true", help="On Windows, assert that piped input is UTF-8 and was not converted by the shell")
+    parser.add_argument("--allow-suspect-question-marks", action="store_true", help="Allow intentional consecutive question marks in a Windows pipe after verifying its original text")
     parser.add_argument("--timeout", type=int, default=60, help="Per-socket network timeout in seconds (1–300)")
     parser.add_argument("--max-tokens", type=int, default=512, help="Maximum output tokens per service (1–4096)")
     args = parser.parse_args(argv)
@@ -309,6 +343,14 @@ def main(argv=None):
         return 2
     if not task.strip() or len(task) > MAX_TASK_CHARS:
         print("Task is empty or exceeds the input limit; no requests sent.", file=sys.stderr)
+        return 2
+    # PowerShell 5.1 can replace non-ASCII text before Python receives it.
+    # This heuristic is incomplete and must not be presented as proof of UTF-8 integrity.
+    if (os.name == "nt" and not args.task_file and not sys.stdin.isatty()
+            and "??" in task and not args.allow_suspect_question_marks):
+        print("Piped input contains consecutive question marks and may be corrupted; "
+              "no requests sent. Use a UTF-8 task file, or verify the original text "
+              "and explicitly add --allow-suspect-question-marks.", file=sys.stderr)
         return 2
     claude_model, grok_model = os.getenv("CLAUDE_MODEL"), os.getenv("GROK_MODEL")
     model_issues = {}

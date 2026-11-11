@@ -67,5 +67,51 @@ class PreflightChecks(unittest.TestCase):
         self.assertTrue(m.valid_key("fake-abc_123+/="))
 
 
+    def test_windows_question_marks_block_before_config_or_request(self):
+        err = io.StringIO()
+        with mock.patch.object(m.os, "name", "nt"), mock.patch.object(sys, "stdin", io.StringIO("?? abc")), \
+             mock.patch.object(m.os, "getenv") as getenv, mock.patch.object(m, "request_json") as request, \
+             mock.patch("sys.stderr", err):
+            code = m.main(["--confirm-paid", "--stdin-utf8"])
+        self.assertEqual(code, 2)
+        getenv.assert_not_called()
+        request.assert_not_called()
+        self.assertIn("may be corrupted", err.getvalue())
+        self.assertNotIn("?? abc", err.getvalue())
+
+    def test_windows_question_marks_can_be_explicitly_allowed(self):
+        env = {"CLAUDE_MODEL": "test-model", "GROK_MODEL": "test-model",
+               "COLLAB_ANTHROPIC_KEY": "fake-a", "COLLAB_XAI_KEY": "fake-b"}
+        calls = []
+        def fake(url, headers, payload, timeout):
+            calls.append(payload)
+            if "anthropic" in url:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "ok"}]}
+            return {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}
+        with mock.patch.object(m.os, "name", "nt"), mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(sys, "stdin", io.StringIO("what??")), mock.patch.object(m, "request_json", side_effect=fake), \
+             mock.patch("sys.stdout", io.StringIO()):
+            code = m.main(["--confirm-paid", "--stdin-utf8", "--allow-suspect-question-marks"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(x.get("messages", x.get("input"))[0]["content"] == "what??" for x in calls))
+
+    def test_windows_task_file_with_question_marks_not_blocked(self):
+        env = {"CLAUDE_MODEL": "test-model", "GROK_MODEL": "test-model",
+               "COLLAB_ANTHROPIC_KEY": "fake-a", "COLLAB_XAI_KEY": "fake-b"}
+        calls = []
+        def fake(url, headers, payload, timeout):
+            calls.append(payload)
+            if "anthropic" in url:
+                return {"stop_reason": "end_turn", "content": [{"type": "text", "text": "ok"}]}
+            return {"status": "completed", "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]}
+        with mock.patch.object(m.os, "name", "nt"), mock.patch.dict(os.environ, env, clear=True), \
+             mock.patch.object(m, "read_task", return_value="what??"), mock.patch.object(m, "request_json", side_effect=fake), \
+             mock.patch("sys.stdout", io.StringIO()):
+            code = m.main(["--confirm-paid", "--task-file", "verified.txt"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 2)
+
+
 if __name__ == "__main__":
     unittest.main()

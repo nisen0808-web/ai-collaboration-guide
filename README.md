@@ -1,5 +1,9 @@
 # AI 多模型协作：最小参考实现
 
+[![离线测试](../../actions/workflows/ci.yml/badge.svg?branch=main&event=push)](../../actions/workflows/ci.yml)
+
+徽章显示主分支最近一次推送的自动测试状态；它不代表真实 API 连接已经验证。
+
 把一个问题分别交给 Claude 和 Grok，再由你或主控 AI 对照、核验结果。程序只依赖 Python 标准库；任何具备终端执行能力的 AI 都可以帮助使用。
 
 这份示例适合**会使用终端、愿意自行开通 API 的人**。它不是插件或一键安装包，也不会合并不同公司的订阅或额度。普通网页聊天不能仅凭仓库链接自动调用本机程序。
@@ -67,7 +71,7 @@ python collaborate.py --task-file task.txt --ask-keys --confirm-paid
 
 `task.txt` 只是示例文件名；请勿将私密任务文件提交到公开仓库。程序严格按 UTF-8 读取，支持 UTF-8 BOM。任务最多 20,000 个字符；空任务、不能按 UTF-8 解码或超出上限时不发送请求。
 
-Windows PowerShell 的管道可能在程序收到内容之前改变编码，PowerShell 5.1 尤其可能把中文替换成问号；一旦替换，程序无法恢复原文。Windows 下默认拒绝管道输入，优先使用交互输入或 `--task-file`。`--stdin-utf8` 仅供能独立确认整个管道已正确传递 UTF-8 原文的使用者显式声明；它不会检查或修复上游已经发生的替换。其他系统的管道也必须确保上游编码正确。
+Windows PowerShell 的管道可能在程序收到内容之前改变编码，PowerShell 5.1 尤其可能把中文替换成问号；一旦替换，程序无法恢复原文。Windows 下默认拒绝管道输入，优先使用交互输入或 `--task-file`。`--stdin-utf8` 仅供能独立确认整个管道已正确传递 UTF-8 原文的使用者显式声明；它不会检查或修复上游已经发生的替换。其他系统的管道也必须确保上游编码正确。 Windows 管道里若出现连续 `??`，程序会在读取密钥和发送前停止，因为这可能是上游替换导致的；如果原文本确实含连续问号，已核对原文后可额外指定 `--allow-suspect-question-marks`。这一启发式会误报，也会漏掉其他乱码，不能证明输入正确。
 
 `--confirm-paid` 用于防止误触，**不是授权机制**：有命令执行能力的程序仍可自行添加该参数。只有在使用者已明确选择 API 及同意费用后，主控 AI 才能调用。发送前会同时检查两家的模型名及凭据格式；任一方本地配置缺失或格式无效时，两家均不发送。本地格式检查无法证明模型可用、密钥有效或账户有额度。
 
@@ -84,6 +88,8 @@ Claude 请求使用 Messages API，版本头 `anthropic-version: 2023-06-01`；x
 - `refused`：供应商拒绝，可能包含返回的说明；`incomplete`：其他尚未完成或不确定的响应。
 - `invalid_response`：响应格式无效或不能解释；`not_submitted`：本地预检未通过，未发出请求。
 - `failed`：供应商返回明确的失败响应；`submission_uncertain`：是否执行或计费无法确定。
+
+HTTP 400 响应仅在错误体符合大小限制且包含已知类型时报告 `error_type`，不会输出错误正文。错误类型可能对应多个原因，不能据此断定是模型、参数还是账户限制。
 
 可用时，输出会包含响应正文中的 `response_id`、HTTP 头中的 `request_id` 和供应商实际返回且符合格式检查的 `usage` 字段；缺失的数据不会被当成零。`cost_in_usd_ticks` 是 xAI 返回的原始单位，100 亿 ticks 等于 1 美元；不是所有响应都会提供，也不是最终账单。返回的模型名可用于核对，思考强度无法确认则标记 `not_verified`。[Claude 停止原因](https://platform.claude.com/docs/en/build-with-claude/handling-stop-reasons)
 
@@ -109,7 +115,7 @@ Claude 请求使用 Messages API，版本头 `anthropic-version: 2023-06-01`；x
 ## 不计费的离线测试
 
 ```sh
-python -m unittest -v test_collaborate test_preflight test_api
+python -m unittest -v test_collaborate test_preflight test_api test_errors
 ```
 
 测试使用模拟响应、假密钥和本机回环地址（用于测试重定向），不请求真实供应商。通过表示覆盖的本机逻辑通过；账号、模型权限、真实网络、真实输出和计费仍需使用者授权后实测。仓库的 GitHub Actions 配置会在支持的 Python 版本上运行相同的离线测试；以 Actions 的实际运行结果为准。
