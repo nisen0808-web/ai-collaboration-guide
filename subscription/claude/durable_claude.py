@@ -127,11 +127,25 @@ class DurableClaudeAdapter:
         fingerprint = hashlib.sha256(json.dumps([task, self.model, self.effort], ensure_ascii=True).encode("ascii")).hexdigest()
         with _connect(self.db) as con:
             con.execute("BEGIN IMMEDIATE")
-            old = con.execute("SELECT fingerprint FROM jobs WHERE id=?", (task_id,)).fetchone()
+            old = con.execute("SELECT fingerprint,status,error,heartbeat FROM jobs WHERE id=?", (task_id,)).fetchone()
             if old:
-                if old[0] != fingerprint:
+                if old["fingerprint"] != fingerprint:
                     return {"status": "not_submitted", "reason": "task_id_conflict"}
-                return {"status": "queued", "job_id": task_id, "replayed": True}
+                prior = old["status"]
+                if prior in ("queued", "running"):
+                    heartbeat = old["heartbeat"]
+                    if heartbeat is None or not 0 <= time.time() - heartbeat <= 10:
+                        prior = "submission_uncertain"
+                    return {"status": prior, "job_id": task_id, "replayed": True}
+                if prior in ("reserved", "submission_uncertain"):
+                    return {"status": "submission_uncertain", "job_id": task_id, "replayed": True}
+                # This invocation did not start new work. Return the handle
+                # of the original terminal record so callers can poll it; do
+                # not claim that a finished or failed job is queued.
+                outcome = ("not_submitted" if prior == "failed" and old["error"] in
+                           ("worker_setup_failed", "input_too_large") else prior)
+                return {"status": "not_submitted", "reason": "already_submitted",
+                        "job_id": task_id, "replayed": True, "existing_status": outcome}
             active = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchone()[0]
             if active >= self.max_concurrency:
                 return {"status": "not_submitted", "reason": "provider_busy"}

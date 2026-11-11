@@ -1,5 +1,6 @@
 """Offline durable-job checks; fake local Python child, no Claude or network."""
 import json
+import hashlib
 from contextlib import closing
 import io
 import os
@@ -83,7 +84,37 @@ class DurableTests(unittest.TestCase):
             self.assertEqual(result["status"], "not_submitted")
             self.assertEqual(a.poll("failed-setup")["status"], "failed")
             self.assertEqual(a.status()["local_active"], 0)
-            self.assertTrue(a.submit("synthetic task", "failed-setup")["replayed"])
+            replay = a.submit("synthetic task", "failed-setup")
+            self.assertTrue(replay["replayed"])
+            self.assertEqual(replay["status"], "not_submitted")
+            self.assertEqual(replay["existing_status"], "not_submitted")
+
+    def test_replay_reports_original_state_without_starting_again(self):
+        a = self.adapter()
+        fingerprint = hashlib.sha256(json.dumps(["synthetic task", "model-example", "medium"],
+                                                ensure_ascii=True).encode("ascii")).hexdigest()
+        with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
+            with con:
+                for job, state, error, heartbeat in (
+                    ("done", "succeeded", None, time.time()),
+                    ("failed", "failed", "provider_error", time.time()),
+                    ("unknown", "submission_uncertain", None, None),
+                    ("reserved", "reserved", None, None),
+                    ("running", "running", None, time.time()),
+                    ("stale", "running", None, time.time() - 11),
+                ):
+                    con.execute("INSERT INTO jobs VALUES (?,?,?,?,?,NULL)",
+                                (job, fingerprint, state, error, heartbeat))
+        with patch("durable_claude.subprocess.Popen", side_effect=AssertionError("started")):
+            for job in ("done", "failed"):
+                replay = a.submit("synthetic task", job)
+                self.assertEqual(replay["status"], "not_submitted")
+                self.assertEqual(replay["reason"], "already_submitted")
+                self.assertEqual(replay["existing_status"], "succeeded" if job == "done" else "failed")
+                self.assertEqual(replay["job_id"], job)
+            for job in ("unknown", "reserved", "stale"):
+                self.assertEqual(a.submit("synthetic task", job)["status"], "submission_uncertain")
+            self.assertEqual(a.submit("synthetic task", "running")["status"], "running")
 
     def test_spawn_error_retains_original_job_id_and_never_restarts_it(self):
         a = self.adapter(max_concurrency=1)
