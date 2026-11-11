@@ -27,7 +27,8 @@ result unavailable; this has not been tested against a real provider. Process
 exit and response text do not prove model or reasoning effort; those fields are
 explicitly marked unverified.
 
-On Windows, one short task using this candidate returned the expected answer
+On Windows, one short task using this candidate's client runtime code returned
+the expected answer
 after subsequent code changes. The candidate reported quality as unverified;
 no official record was obtained to independently confirm the actual model or
 effort for that task. This does not establish reliability on other systems,
