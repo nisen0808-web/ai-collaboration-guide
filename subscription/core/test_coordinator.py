@@ -70,6 +70,102 @@ class LedgerTests(unittest.TestCase):
         finally:
             sys.path.remove(package_root)
 
+    def test_grok_double_write_failure_keeps_original_handle_without_retry(self):
+        root = Path(self.tmp.name)
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from grok import durable_grok
+            state, profile, cli = root / "grok-state", root / "grok-profile", root / "synthetic-grok"
+            state.mkdir()
+            profile.mkdir()
+            cli.touch()
+            adapter = durable_grok.DurableGrokAdapter(str(cli), "synthetic-model", "medium",
+                                                       str(profile), str(state), max_concurrency=1)
+            coordinator = Coordinator(self.db, {"grok": adapter})
+            with patch.object(adapter.ledger, "write_request", side_effect=OSError("request")), \
+                 patch.object(adapter.ledger, "finish_known_unstarted", side_effect=OSError("ledger")), \
+                 patch.object(durable_grok.subprocess, "Popen", side_effect=AssertionError("must not start")) as launch:
+                result = coordinator.submit("grok", "synthetic task", "request-key")
+                self.assertEqual(result["status"], "submission_uncertain")
+                self.assertTrue(result.get("job_id"))
+                self.assertEqual(coordinator.submit("grok", "synthetic task", "request-key")["job_id"], result["job_id"])
+                self.assertEqual(adapter.status()["local_available_slots"], 0)
+                launch.assert_not_called()
+            # Only the built-in adapter's versioned, task-bound evidence can
+            # reconcile the original receipt after local storage recovers.
+            self.assertEqual(adapter.status()["local_available_slots"], 1)
+            self.assertEqual(coordinator.result("grok", "request-key")["status"], "not_submitted")
+            self.assertEqual(coordinator.get("request-key")["reason"], "state_write_failed")
+            self.assertEqual(coordinator.get("request-key")["job_id"], result["job_id"])
+        finally:
+            sys.path.remove(package_root)
+
+    def test_generic_adapter_cannot_self_attest_prelaunch(self):
+        class FakeAdapter:
+            def submit(self, **kwargs):
+                return {"status": "submission_uncertain", "job_id": "job-fake"}
+            def poll(self, job_id):
+                return {"status": "not_submitted", "reason": "state_write_failed",
+                        "prelaunch_aborted_v1": True}
+            def proves_prelaunch_aborted(self, task_id, job_id):
+                return True
+        coordinator = Coordinator(self.db, {"grok": FakeAdapter()})
+        coordinator.submit("grok", "synthetic task", "request-key")
+        self.assertEqual(coordinator.result("grok", "request-key")["status"], "submission_uncertain")
+
+    def test_old_and_mismatched_local_evidence_is_never_promoted(self):
+        root = Path(self.tmp.name)
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from grok import durable_grok
+            state, profile, cli = root / "grok-state", root / "grok-profile", root / "synthetic-grok"
+            state.mkdir()
+            profile.mkdir()
+            cli.touch()
+            adapter = durable_grok.DurableGrokAdapter(str(cli), "synthetic-model", "medium", str(profile), str(state))
+            coordinator = Coordinator(self.db, {"grok": adapter})
+            with patch.object(adapter.ledger, "write_request", side_effect=OSError("request")), \
+                 patch.object(adapter.ledger, "finish_known_unstarted", side_effect=OSError("ledger")):
+                result = coordinator.submit("grok", "synthetic task", "request-key")
+            job_id, task_id = result["job_id"], result["task_id"]
+            # Legacy generic terminal state is not the new, narrowly defined proof.
+            old = {"status": "not_submitted", "job_id": job_id, "reason": "state_write_failed"}
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET state='not_submitted',result_json=? WHERE job_id=?",
+                            (__import__("json").dumps(old), job_id))
+            self.assertFalse(adapter.proves_prelaunch_aborted(task_id, job_id))
+            with patch.object(adapter, "proves_prelaunch_aborted", return_value=True):
+                self.assertEqual(coordinator.result("grok", "request-key")["status"], "submission_uncertain")
+            # A versioned state still cannot prove a different original task.
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET state=? WHERE job_id=?", (durable_grok._PRELAUNCH_ABORTED, job_id))
+            self.assertFalse(adapter.proves_prelaunch_aborted("wrong-task", job_id))
+            self.assertFalse(adapter.proves_prelaunch_aborted(task_id, "00000000-0000-0000-0000-000000000000"))
+            # Claimed identity invalidates even the versioned state.
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET worker_pid=123 WHERE job_id=?", (job_id,))
+            self.assertEqual(coordinator.result("grok", "request-key")["status"], "submission_uncertain")
+        finally:
+            sys.path.remove(package_root)
+
+    def test_proof_cannot_overwrite_a_concurrent_terminal_result(self):
+        class Adapter:
+            def submit(self, **kwargs):
+                return {"status": "submission_uncertain", "job_id": "job-original"}
+            def poll(self, job_id):
+                return {"status": "not_submitted", "reason": "state_write_failed"}
+        coordinator = Coordinator(self.db, {"grok": Adapter()})
+        coordinator.submit("grok", "synthetic task", "request-key")
+        def concurrent_success(*args):
+            with coordinator._db() as conn:
+                conn.execute("UPDATE requests SET status='succeeded' WHERE request_key='request-key'")
+            return True
+        with patch("coordinator._proved_grok_prelaunch_abort", side_effect=concurrent_success):
+            coordinator.result("grok", "request-key")
+        self.assertEqual(coordinator.get("request-key")["status"], "succeeded")
+
     def test_replay_never_dispatches_again(self):
         calls = []
         c = Coordinator(self.db, {"grok": lambda **kw: calls.append(kw) or {"status": "queued", "job_id": "job-1"}})

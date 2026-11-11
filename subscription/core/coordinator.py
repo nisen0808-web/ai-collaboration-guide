@@ -48,6 +48,19 @@ def _canonical(value: dict) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _proved_grok_prelaunch_abort(adapter: object, task_id: str, job_id: str) -> bool:
+    """Trust only the built-in adapter's bound, versioned local ledger evidence."""
+    try:
+        from grok.durable_grok import DurableGrokAdapter
+        if type(adapter) is not DurableGrokAdapter:
+            return False
+        # Do not trust a generic adapter flag, duck-typed method, subclass, or
+        # instance-level method override as proof about a provider request.
+        return DurableGrokAdapter.proves_prelaunch_aborted(adapter, task_id, job_id) is True
+    except (ImportError, OSError, sqlite3.Error, ValueError, TypeError):
+        return False
+
+
 def _result_unavailable(current: dict, reason: str) -> dict:
     """Distinguish a lost successful result from unknown execution."""
     if current.get("status") == "succeeded" or current.get("execution_status") == "succeeded":
@@ -264,10 +277,13 @@ class Coordinator:
             if not isinstance(response, dict) or response.get("status") not in valid:
                 raise ValueError("invalid response")
             observed = response["status"]
-            # A job receipt already existed. A later missing or not-submitted
-            # result cannot prove the original request was never executed.
+            # A generic later not-submitted response cannot prove that the
+            # original receipt did not represent a real provider request.
             if observed == "not_submitted":
-                observed = "submission_uncertain"
+                if provider == "grok" and _proved_grok_prelaunch_abort(adapter, current["task_id"], current["job_id"]):
+                    observed = "not_submitted"
+                else:
+                    observed = "submission_uncertain"
             if observed == "succeeded" and not isinstance(response.get("output"), str):
                 return _result_unavailable(current, "incomplete_result")
             if "output" in response and not isinstance(response["output"], str):
@@ -282,11 +298,15 @@ class Coordinator:
         except Exception:
             # Never expose exception text (which might contain credentials).
             return _result_unavailable(current, "adapter_error")
-        terminals = {"succeeded", "failed", "cancelled", "timed_out", "blocked", "incomplete", "refused"}
+        terminals = {"succeeded", "failed", "cancelled", "timed_out", "blocked", "incomplete", "refused", "not_submitted"}
         with self._db() as conn:
             # A late stale poll must not overwrite any terminal result.
-            conn.execute("UPDATE requests SET status = ?, reason = CASE WHEN ? THEN 'truncated_output' ELSE reason END WHERE request_key = ? AND status IN ('queued', 'running', 'submission_uncertain')",
-                         (observed, truncated_success, request_key))
+            conn.execute("UPDATE requests SET status = ?, reason = CASE WHEN ? THEN 'truncated_output' "
+                         "WHEN ? THEN 'state_write_failed' ELSE reason END "
+                         "WHERE request_key = ? AND provider = ? AND task_id = ? AND job_id = ? "
+                         "AND status IN ('queued', 'running', 'submission_uncertain')",
+                         (observed, truncated_success, observed == "not_submitted", request_key,
+                          provider, current["task_id"], current["job_id"]))
             persisted = conn.execute("SELECT status, reason FROM requests WHERE request_key = ?", (request_key,)).fetchone()
             actual = persisted["status"]
             was_truncated = actual == "incomplete" and persisted["reason"] == "truncated_output"

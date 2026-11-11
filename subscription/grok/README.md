@@ -48,3 +48,25 @@ retry, automatic recursive cleanup, or mechanism to recover the result after an
 unconfirmed worker crash. Local concurrency is counted in this ledger and does
 not represent an official provider quota. Synthetic subprocess tests do not
 verify actual CLI, authentication, billing, filesystem ACLs, or provider policy.
+
+If the local request write fails before this adapter launches its worker, the
+adapter only records a confirmed unstarted outcome when an atomic ledger update
+proves no worker has claimed that reservation. If the update fails, it returns
+an uncertain result with the original job ID and keeps the local slot. While
+the same adapter remains alive, a later status check or submission can repeat
+the conditional ledger update when storage recovers; it never restarts the
+provider request or overwrites a claimed worker. If the adapter process exits
+first, storage remains unavailable, or another worker claimed the job, the
+reservation remains conservative rather than being released on an assumption.
+The coordinator may reconcile that original receipt as not submitted only from
+the built-in durable adapter's versioned ledger state, bound to the same task
+and job. Older generic states and third-party adapter claims remain uncertain.
+This local evidence assumes the tool-owned state directory has not been
+tampered with; it is not a cryptographic or remote-provider attestation.
+Every older generic `not_submitted` Grok ledger row is also counted against local
+capacity, because earlier code could write that state after a competing worker
+had claimed the job. Even a legacy row that really was never submitted cannot
+be safely distinguished from that race from the row alone; old rows are not
+changed or automatically released. Enough such rows can leave Grok locally
+busy, and the current candidate does not provide an automatic reconciliation
+command for them. Other providers can continue independently.

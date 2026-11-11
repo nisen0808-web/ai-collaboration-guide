@@ -177,6 +177,113 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(conflict["reason"], "task_id_conflict")
         self.assertEqual(adapter.status()["local_available_slots"], 1)
 
+    def test_transient_double_write_failure_recovers_slot_without_dispatch(self):
+        adapter = self.adapter()
+        with mock.patch.object(adapter.ledger, "write_request", side_effect=OSError("request failure")), \
+             mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("started")) as launch:
+            with mock.patch.object(adapter.ledger, "finish_known_unstarted", side_effect=OSError("still unavailable")):
+                result = adapter.submit("task", "task-1")
+                self.assertEqual(result["status"], "submission_uncertain")
+                self.assertTrue(result.get("job_id"))
+                self.assertEqual(adapter.status()["local_available_slots"], 0)
+            # State storage has recovered: a read reconciles the known
+            # pre-launch failure without dispatching or changing task keys.
+            self.assertEqual(adapter.status()["local_available_slots"], 1)
+            replay = adapter.submit("task", "task-1")
+            self.assertEqual(replay["status"], "not_submitted")
+            self.assertEqual(replay["reason"], "state_write_failed")
+            self.assertTrue(replay["replayed"])
+            self.assertEqual(self.adapter().submit("task", "task-1")["status"], "not_submitted")
+            launch.assert_not_called()
+
+    def test_recovery_does_not_overwrite_a_claimed_worker(self):
+        adapter = self.adapter()
+        with mock.patch.object(adapter.ledger, "write_request", side_effect=OSError("request failure")), \
+             mock.patch.object(subject.subprocess, "Popen") as launch:
+            with mock.patch.object(adapter.ledger, "finish_known_unstarted", side_effect=OSError("ledger failure")):
+                result = adapter.submit("task", "task-1")
+            self.assertEqual(result["status"], "submission_uncertain")
+            job_id = adapter.ledger.find_job("task-1")
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET state='running', worker_pid=? WHERE job_id=?", (123, job_id))
+            self.assertEqual(adapter.status()["local_available_slots"], 0)
+            self.assertEqual(adapter.ledger.get(job_id).state, "running")
+            launch.assert_not_called()
+
+    def test_lost_process_memory_does_not_guess_unstarted(self):
+        adapter = self.adapter()
+        with mock.patch.object(adapter.ledger, "write_request", side_effect=OSError("request failure")), \
+             mock.patch.object(subject.subprocess, "Popen") as launch:
+            with mock.patch.object(adapter.ledger, "finish_known_unstarted", side_effect=OSError("ledger failure")):
+                result = adapter.submit("task", "task-1")
+            self.assertEqual(result["status"], "submission_uncertain")
+            restarted = self.adapter()
+            self.assertEqual(restarted.status()["local_available_slots"], 0)
+            replay = restarted.submit("task", "task-1")
+            self.assertEqual(replay["status"], "submission_uncertain")
+            launch.assert_not_called()
+
+    def test_request_write_race_with_claim_never_overwrites_worker(self):
+        adapter = self.adapter()
+        def claimed_then_write_fails(job_id, request):
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET state='running',worker_pid=?,result_json=? WHERE job_id=?",
+                            (123, json.dumps({"status": "running", "job_id": job_id}), job_id))
+            raise OSError("request failure with competing claim")
+        with mock.patch.object(adapter.ledger, "write_request", side_effect=claimed_then_write_fails), \
+             mock.patch.object(subject.subprocess, "Popen") as launch:
+            result = adapter.submit("task", "task-1")
+            self.assertEqual(result["status"], "submission_uncertain")
+            self.assertTrue(result.get("job_id"))
+            job = adapter.ledger.get(result["job_id"])
+            self.assertEqual(job.state, "running")
+            self.assertEqual(job.result["status"], "running")
+            self.assertEqual(adapter.status()["local_available_slots"], 0)
+            replay = adapter.submit("task", "task-1")
+            self.assertEqual(replay["status"], "submission_uncertain")
+            self.assertEqual(replay["job_id"], result["job_id"])
+            launch.assert_not_called()
+
+    def test_legacy_unconfirmed_terminal_is_not_promoted_on_poll_or_replay(self):
+        adapter = self.adapter()
+        with mock.patch.object(adapter.ledger, "write_request", side_effect=OSError("request failure")), \
+             mock.patch.object(subject.subprocess, "Popen") as launch:
+            self.assertEqual(adapter.submit("task", "task-1")["status"], "not_submitted")
+            job_id = adapter.find_job("task-1")
+            with adapter.ledger._connect() as con:
+                # Old generic rows cannot prove that another worker had not
+                # already been launched by an earlier version.
+                con.execute("UPDATE jobs SET state='not_submitted' WHERE job_id=?", (job_id,))
+            self.assertEqual(adapter.poll(job_id)["status"], "submission_uncertain")
+            self.assertEqual(adapter.submit("task", "task-1")["status"], "submission_uncertain")
+            self.assertEqual(adapter.ledger.capacity(), 1)
+            self.assertEqual(adapter.status()["local_available_slots"], 0)
+            self.assertEqual(adapter.submit("another", "task-2")["reason"], "provider_busy")
+            self.assertEqual(adapter.ledger.get(job_id).state, "not_submitted")
+            # Both a genuinely unstarted legacy record and one with a worker
+            # identity stay conservative; neither is rewritten automatically.
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET worker_pid=123,worker_identity=? WHERE job_id=?",
+                            ("old-worker", job_id))
+            self.assertEqual(adapter.status()["local_available_slots"], 0)
+            self.assertEqual(adapter.submit("another", "task-2")["reason"], "provider_busy")
+            self.assertEqual(adapter.ledger.get(job_id).worker_identity, "old-worker")
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET state=?,worker_pid=NULL,worker_identity=? WHERE job_id=?",
+                            (subject._PRELAUNCH_ABORTED, "unknown-identity", job_id))
+            self.assertEqual(adapter.poll(job_id)["status"], "submission_uncertain")
+            self.assertEqual(adapter.status()["local_available_slots"], 0)
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET worker_identity=NULL,result_json=? WHERE job_id=?",
+                            ("invalid-json", job_id))
+            self.assertEqual(adapter.poll(job_id)["status"], "submission_uncertain")
+            self.assertEqual(adapter.status()["local_available_slots"], 0)
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET result_json=? WHERE job_id=?",
+                            (json.dumps({"status":"not_submitted","job_id":job_id,"reason":"state_write_failed"}), job_id))
+            self.assertEqual(adapter.status()["local_available_slots"], 1)
+            launch.assert_not_called()
+
     def test_confirmed_exit_retains_uncertain_partial_and_frees_only_local_slot(self):
         adapter = self.adapter()
         with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)) as launch:

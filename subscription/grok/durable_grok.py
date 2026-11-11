@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import uuid
 
 if __package__:
@@ -26,7 +27,12 @@ else:
     from grok_adapter import GrokAdapter, _MAX_TASK_BYTES, _NETWORK_ENV_NAMES
 
 
-_ACTIVE = ("dispatching", "queued", "running", "submission_uncertain")
+# Legacy ``not_submitted`` rows predate atomic pre-launch proof.  Earlier
+# versions could write that state after a competing worker claimed the row;
+# treat every such row as occupied until separately reconciled, even if its
+# identity fields are empty. New proven failures use _PRELAUNCH_ABORTED.
+_ACTIVE = ("dispatching", "queued", "running", "submission_uncertain", "not_submitted")
+_PRELAUNCH_ABORTED = "prelaunch_aborted_v1"
 _SCHEMA = """CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY, task_key TEXT NOT NULL UNIQUE,
     task_digest TEXT NOT NULL, state TEXT NOT NULL,
@@ -125,8 +131,7 @@ class _Ledger:
             old = con.execute("SELECT job_id, task_digest FROM jobs WHERE task_key=?", (task_key,)).fetchone()
             if old:
                 return ("existing" if old["task_digest"] == digest else "conflict", old["job_id"])
-            placeholders = ",".join("?" for _ in _ACTIVE)
-            active = con.execute(f"SELECT count(*) FROM jobs WHERE state IN ({placeholders})", _ACTIVE).fetchone()[0]
+            active = len(self._active_rows(con))
             if active >= max_concurrency:
                 return "busy", None
             job_id = str(uuid.uuid4())
@@ -179,6 +184,30 @@ class _Ledger:
                         "AND state=? AND worker_pid IS NULL",
                         (state["status"], json.dumps(state), job_id, "dispatching"))
 
+    def finish_known_unstarted(self, job_id: str) -> bool:
+        """Persist a caller-observed pre-launch failure without overwriting a claim."""
+        state = {"status": "not_submitted", "job_id": job_id, "reason": "state_write_failed"}
+        with self._connect() as con:
+            changed = con.execute("UPDATE jobs SET state=?, result_json=? WHERE job_id=? "
+                                  "AND state=? AND worker_pid IS NULL AND worker_identity IS NULL",
+                                  (_PRELAUNCH_ABORTED, json.dumps(state), job_id, "dispatching")).rowcount
+        return changed == 1
+
+    def proves_prelaunch_aborted(self, task_id: str, job_id: str) -> bool:
+        """Check local immutable-state evidence bound to the original task/job."""
+        if not _valid_id(job_id) or not isinstance(task_id, str) or not 1 <= len(task_id) <= 128:
+            return False
+        try:
+            task_key = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+            with self._connect() as con:
+                row = con.execute("SELECT result_json FROM jobs WHERE job_id=? AND task_key=? "
+                                  "AND state=? AND worker_pid IS NULL AND worker_identity IS NULL",
+                                  (job_id, task_key, _PRELAUNCH_ABORTED)).fetchone()
+            return bool(row and json.loads(row["result_json"]) == {
+                "status": "not_submitted", "job_id": job_id, "reason": "state_write_failed"})
+        except (OSError, sqlite3.Error, ValueError, TypeError, UnicodeError):
+            return False
+
     def get(self, job_id: str) -> _StoredJob | None:
         if not _valid_id(job_id):
             return None
@@ -190,9 +219,28 @@ class _Ledger:
                           json.loads(row["result_json"]))
 
     def capacity(self) -> int:
-        placeholders = ",".join("?" for _ in _ACTIVE)
         with self._connect() as con:
-            return con.execute(f"SELECT count(*) FROM jobs WHERE state IN ({placeholders})", _ACTIVE).fetchone()[0]
+            return len(self._active_rows(con))
+
+    @staticmethod
+    def _active_rows(con: sqlite3.Connection) -> list[sqlite3.Row]:
+        placeholders = ",".join("?" for _ in _ACTIVE)
+        rows = con.execute(f"SELECT job_id,state,worker_pid,worker_identity,result_json FROM jobs "
+                           f"WHERE state IN ({placeholders}) OR state=?",
+                           (*_ACTIVE, _PRELAUNCH_ABORTED)).fetchall()
+        active = []
+        for row in rows:
+            if row["state"] == _PRELAUNCH_ABORTED:
+                try:
+                    expected = {"status": "not_submitted", "job_id": row["job_id"], "reason": "state_write_failed"}
+                    valid = (_valid_id(row["job_id"]) and row["worker_pid"] is None and row["worker_identity"] is None
+                             and json.loads(row["result_json"]) == expected)
+                except (ValueError, TypeError):
+                    valid = False
+                if valid:
+                    continue
+            active.append(row)
+        return active
 
     def find_job(self, task_id: str) -> str | None:
         if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128:
@@ -210,9 +258,8 @@ class _Ledger:
 
     def occupancy(self) -> tuple[int, int]:
         """Return known-running and uncertain counts; never release slots."""
-        placeholders = ",".join("?" for _ in _ACTIVE)
         with self._connect() as con:
-            rows = con.execute(f"SELECT state,worker_pid,worker_identity FROM jobs WHERE state IN ({placeholders})", _ACTIVE).fetchall()
+            rows = self._active_rows(con)
         def is_observed(row):
             if row["state"] not in ("queued", "running") or not row["worker_identity"]:
                 return False
@@ -245,6 +292,22 @@ class DurableGrokAdapter:
         self.adapter = GrokAdapter(cli, model, effort, profile_dir, timeout_seconds, max_concurrency)
         self.ledger = _Ledger(Path(state_root))
         self.max_concurrency = max_concurrency
+        # Only this live adapter can know that its write failed before Popen.
+        # Never reconstruct this evidence from an unclaimed database row.
+        self._known_unstarted: set[str] = set()
+        self._known_unstarted_lock = threading.Lock()
+
+    def _flush_known_unstarted(self) -> None:
+        # Retrying a local state write is not retrying a provider request.
+        # If the process dies before this succeeds, the persisted reservation
+        # remains uncertain and continues to occupy its slot conservatively.
+        with self._known_unstarted_lock:
+            for job_id in tuple(self._known_unstarted):
+                try:
+                    self.ledger.finish_known_unstarted(job_id)
+                except (OSError, sqlite3.Error):
+                    continue
+                self._known_unstarted.remove(job_id)
 
     def login(self) -> int:
         return self.adapter.login()
@@ -252,6 +315,12 @@ class DurableGrokAdapter:
     def find_job(self, task_id: str) -> str | None:
         """Find a recorded job without dispatching or retrying it."""
         return self.ledger.find_job(task_id)
+
+    def proves_prelaunch_aborted(self, task_id: str, job_id: str) -> bool:
+        """Verify a versioned local ledger state, not an adapter-supplied flag."""
+        if type(self.ledger) is not _Ledger:
+            return False
+        return _Ledger.proves_prelaunch_aborted(self.ledger, task_id, job_id)
 
     def __call__(self, task: str, task_id: str) -> dict:
         return self.submit(task, task_id)
@@ -266,6 +335,7 @@ class DurableGrokAdapter:
             return {"status": "not_submitted", "reason": "invalid_task"}
         if len(data) > _MAX_TASK_BYTES or not self.adapter._paths_ready():
             return {"status": "not_submitted", "reason": "invalid_task_or_configuration"}
+        self._flush_known_unstarted()
         try:
             result, job_id = self.ledger.reserve(task_id, hashlib.sha256(data).hexdigest(), self.max_concurrency)
         except (OSError, sqlite3.Error):
@@ -276,7 +346,8 @@ class DurableGrokAdapter:
             return {"status": "not_submitted", "reason": "task_id_conflict"}
         if result == "existing":
             old = self.poll(job_id)
-            if old.get("status") == "not_submitted" and old.get("reason") == "state_write_failed":
+            if (old.get("status") == "not_submitted" and old.get("reason") == "state_write_failed"
+                    and _Ledger.proves_prelaunch_aborted(self.ledger, task_id, job_id)):
                 # This exact persisted state is written only before any worker
                 # launch is attempted. Preserve the truthful outcome without
                 # launching again or implying an earlier provider submission.
@@ -293,13 +364,21 @@ class DurableGrokAdapter:
             self.ledger.write_request(job_id, request)
         except (OSError, ValueError):
             try:
-                self.ledger.store(job_id, {"status": "not_submitted", "job_id": job_id, "reason": "state_write_failed"})
+                unclaimed = self.ledger.finish_known_unstarted(job_id)
             except (OSError, sqlite3.Error):
-                pass  # No worker was launched; stale reservation stays conservative.
-            # No worker launch was attempted. Do not expose this local
-            # reservation as a provider job handle: the coordinator treats
-            # a handle as evidence that submission may have occurred.
-            return {"status": "not_submitted", "reason": "state_write_failed"}
+                with self._known_unstarted_lock:
+                    self._known_unstarted.add(job_id)
+                # This caller did not launch a worker, but the failed commit
+                # cannot exclude a competing claimant. Keep the original ID.
+                return {"status": "submission_uncertain", "job_id": job_id,
+                        "error": "worker_start_unconfirmed"}
+            if unclaimed:
+                return {"status": "not_submitted", "reason": "state_write_failed"}
+            # A worker may have claimed the reservation while this caller's
+            # request write was failing; never overwrite its state or assert
+            # that the provider was not reached.
+            return {"status": "submission_uncertain", "job_id": job_id,
+                    "error": "worker_start_unconfirmed"}
         options = {"cwd": str(self.ledger.root), "env": _worker_env(), "stdin": subprocess.DEVNULL,
                    "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "shell": False, "close_fds": True}
         if os.name == "nt":
@@ -319,18 +398,26 @@ class DurableGrokAdapter:
         return {"status": "queued", "job_id": job_id}
 
     def poll(self, job_id: str) -> dict:
+        self._flush_known_unstarted()
         try:
             job = self.ledger.get(job_id)
         except (OSError, sqlite3.Error, ValueError, TypeError):
             job = None
         if job is None:
             return {"status": "submission_uncertain", "job_id": job_id, "error": "job_state_unavailable"}
+        if job.result.get("status") == "not_submitted":
+            expected = {"status": "not_submitted", "job_id": job_id, "reason": "state_write_failed"}
+            if (job.state != _PRELAUNCH_ABORTED or job.worker_pid is not None
+                    or job.worker_identity is not None or job.result != expected):
+                return {"status": "submission_uncertain", "job_id": job_id,
+                        "error": "worker_start_unconfirmed"}
         if job.state in {"dispatching", "queued", "running"}:
             if not job.worker_identity or _process_identity(job.worker_pid) != job.worker_identity:
                 return {"status": "submission_uncertain", "job_id": job_id, "error": "worker_identity_unconfirmed"}
         return dict(job.result)
 
     def status(self) -> dict:
+        self._flush_known_unstarted()
         observed, uncertain = self.ledger.occupancy()
         active = observed + uncertain
         with self.ledger._connect() as con:
