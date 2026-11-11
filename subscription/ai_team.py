@@ -31,9 +31,9 @@ def build_adapters(args: argparse.Namespace) -> dict:
     data = Path(args.data_dir).expanduser().resolve()
     data.mkdir(parents=True, exist_ok=True, mode=0o700)
     adapters = {}
-    claude_cli = executable(args.claude_cli)
-    if claude_cli:
-        try:
+    try:
+        claude_cli = executable(args.claude_cli)
+        if claude_cli:
             profile = (Path(args.claude_profile).expanduser().resolve()
                        if args.claude_profile else data / "claude-profile")
             work = data / "claude-work"
@@ -45,12 +45,13 @@ def build_adapters(args: argparse.Namespace) -> dict:
                 claude_cli, str(profile), str(work), str(state), args.claude_model,
                 args.claude_effort, enabled=True, timeout_seconds=args.timeout,
             )
-        except (OSError, ValueError, TypeError):
-            # One unavailable provider must not prevent the other starting.
-            pass
-    grok_cli = executable(args.grok_cli)
-    if grok_cli:
-        try:
+    except Exception:
+        # One unavailable provider, including a broken local database, must
+        # not prevent the other starting. Do not expose exception details.
+        pass
+    try:
+        grok_cli = executable(args.grok_cli)
+        if grok_cli:
             profile = (Path(args.grok_profile).expanduser().resolve()
                        if args.grok_profile else data / "grok-profile")
             profile.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -58,8 +59,8 @@ def build_adapters(args: argparse.Namespace) -> dict:
                 grok_cli, args.grok_model, args.grok_effort, str(profile), str(data),
                 timeout_seconds=args.timeout,
             )
-        except (OSError, ValueError, TypeError):
-            pass
+    except Exception:
+        pass
     return adapters
 
 
@@ -132,7 +133,7 @@ def main(argv: list[str] | None = None) -> int:
                 stream.reconfigure(encoding="utf-8", errors="strict")
         serve(core, sys.stdin, sys.stdout)
         return 0
-    except (OSError, ValueError, TypeError):
+    except Exception:
         # Do not echo local paths, credentials, or exception text in MCP logs.
         print("Unable to start the local collaboration service.", file=sys.stderr)
         return 1

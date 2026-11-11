@@ -54,6 +54,37 @@ class DurableTests(unittest.TestCase):
         self.insert("missing-output", "succeeded")
         self.assertEqual(a.poll("missing-output")["status"], "submission_uncertain")
 
+    def test_status_distinguishes_unknown_from_recent_heartbeat_without_releasing(self):
+        a = self.adapter(max_concurrency=2)
+        self.insert("unknown", "submission_uncertain")
+        self.insert("tracked", "running")
+        with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
+            with con:
+                con.execute("UPDATE jobs SET heartbeat=? WHERE id='tracked'", (time.time(),))
+        status = a.status()
+        self.assertEqual(status["local_active"], 2)
+        self.assertEqual(status["local_uncertain"], 1)
+        self.assertEqual(status["local_observed_inflight"], 1)
+        self.assertEqual(a.submit("other", "new")["reason"], "provider_busy")
+
+    def test_find_job_is_read_only_and_does_not_launch(self):
+        a = self.adapter()
+        self.insert("recorded", "submission_uncertain")
+        with patch("durable_claude.subprocess.Popen", side_effect=AssertionError("started")):
+            self.assertEqual(a.find_job("recorded"), "recorded")
+            self.assertIsNone(a.find_job("missing"))
+            self.assertIsNone(a.find_job("../bad"))
+
+    def test_setup_failure_before_spawn_releases_only_its_slot(self):
+        a = self.adapter(max_concurrency=1)
+        with patch("durable_claude.child_environment", side_effect=OSError("synthetic failure")), \
+             patch("durable_claude.subprocess.Popen", side_effect=AssertionError("started")):
+            result = a.submit("synthetic task", "failed-setup")
+            self.assertEqual(result["status"], "not_submitted")
+            self.assertEqual(a.poll("failed-setup")["status"], "failed")
+            self.assertEqual(a.status()["local_active"], 0)
+            self.assertTrue(a.submit("synthetic task", "failed-setup")["replayed"])
+
     def test_spawn_error_retains_original_job_id_and_never_restarts_it(self):
         a = self.adapter(max_concurrency=1)
         with patch("durable_claude.subprocess.Popen", side_effect=OSError("synthetic failure")) as spawn:

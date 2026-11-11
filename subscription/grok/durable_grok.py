@@ -189,6 +189,35 @@ class _Ledger:
         with self._connect() as con:
             return con.execute(f"SELECT count(*) FROM jobs WHERE state IN ({placeholders})", _ACTIVE).fetchone()[0]
 
+    def find_job(self, task_id: str) -> str | None:
+        if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128:
+            return None
+        try:
+            task_key = hashlib.sha256(task_id.encode("utf-8")).hexdigest()
+        except UnicodeError:
+            return None
+        try:
+            with self._connect() as con:
+                row = con.execute("SELECT job_id FROM jobs WHERE task_key=?", (task_key,)).fetchone()
+        except (OSError, sqlite3.Error):
+            return None
+        return row[0] if row else None
+
+    def occupancy(self) -> tuple[int, int]:
+        """Return known-running and uncertain counts; never release slots."""
+        placeholders = ",".join("?" for _ in _ACTIVE)
+        with self._connect() as con:
+            rows = con.execute(f"SELECT state,worker_pid,worker_identity FROM jobs WHERE state IN ({placeholders})", _ACTIVE).fetchall()
+        def is_observed(row):
+            if row["state"] not in ("queued", "running") or not row["worker_identity"]:
+                return False
+            try:
+                return _process_identity(row["worker_pid"]) == row["worker_identity"]
+            except (OSError, ValueError):
+                return False
+        observed = sum(is_observed(row) for row in rows)
+        return observed, len(rows) - observed
+
 
 def _worker_command(root: Path, job_id: str) -> list[str]:
     return [sys.executable, str(Path(__file__).resolve()), "--worker", str(root), job_id]
@@ -212,6 +241,10 @@ class DurableGrokAdapter:
 
     def login(self) -> int:
         return self.adapter.login()
+
+    def find_job(self, task_id: str) -> str | None:
+        """Find a recorded job without dispatching or retrying it."""
+        return self.ledger.find_job(task_id)
 
     def __call__(self, task: str, task_id: str) -> dict:
         return self.submit(task, task_id)
@@ -281,8 +314,10 @@ class DurableGrokAdapter:
         return dict(job.result)
 
     def status(self) -> dict:
-        active = self.ledger.capacity()
+        observed, uncertain = self.ledger.occupancy()
+        active = observed + uncertain
         return {"provider": "grok", "local_active_jobs": active, "local_max_concurrency": self.max_concurrency,
+                "local_observed_inflight": observed, "local_uncertain": uncertain,
                 "local_available_slots": max(0, self.max_concurrency - active), "official_quota_verified": False,
                 "login_verified": False}
 

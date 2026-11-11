@@ -150,6 +150,7 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
             def status(self):
                 return {"ready": True, "loggedIn": True, "authMethod": "cached_token", "secret": "dont-copy",
                         "local_active_jobs": 1, "local_max_concurrency": 2, "local_available_slots": 1,
+                        "local_observed_inflight": 1, "local_uncertain": 2,
                         "official_quota_verified": False}
         c = Coordinator(self.db, {"claude": Claude(), "grok": Grok()}, status_timeout=0.1)
         try:
@@ -160,6 +161,8 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
             self.assertEqual(result["grok"]["authMethod"], "cached_token")
             self.assertTrue(result["grok"]["reported_by_adapter"])
             self.assertEqual(result["grok"]["local_available_slots"], 1)
+            self.assertEqual(result["grok"]["local_observed_inflight"], 1)
+            self.assertEqual(result["grok"]["local_uncertain"], 2)
             self.assertFalse(result["grok"]["official_quota_verified"])
             self.assertEqual(result["grok"]["verification"], "not_verified")
             self.assertNotIn("secret", str(result))
@@ -217,6 +220,79 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         c = Coordinator(self.db, {"grok": adapter})
         self.assertEqual(c.submit("grok", "task", "key")["job_id"], "job-unknown")
         self.assertEqual(c.result("grok", "key")["output"], "recovered")
+        self.assertEqual(adapter.submits, 1)
+
+    def test_lost_receipt_is_recovered_by_original_task_id_after_restart(self):
+        class Adapter:
+            def __init__(self): self.submits = 0; self.recorded = {}
+            def submit(self, *, task, task_id):
+                self.submits += 1
+                self.recorded[task_id] = "original-worker"
+                raise RuntimeError("after worker launch")
+            def find_job(self, task_id): return self.recorded.get(task_id)
+            def poll(self, job_id):
+                self.polled = job_id
+                return {"status": "succeeded", "output": "original result"}
+        adapter = Adapter()
+        receipt = Coordinator(self.db, {"claude": adapter}).submit("claude", "task", "key")
+        self.assertEqual(receipt["status"], "submission_uncertain")
+        self.assertIsNone(receipt["job_id"])
+        restarted = Coordinator(self.db, {"claude": adapter})
+        recovered = restarted.result("claude", "key")
+        self.assertEqual(recovered["job_id"], "original-worker")
+        self.assertEqual(recovered["output"], "original result")
+        self.assertEqual(adapter.polled, "original-worker")
+        self.assertEqual(adapter.submits, 1)
+        self.assertEqual(restarted.get("key")["job_id"], "original-worker")
+
+    def test_missing_invalid_or_failed_lookup_remains_uncertain_and_never_retries(self):
+        class Adapter:
+            def __init__(self): self.submits = 0; self.value = None
+            def submit(self, **kwargs):
+                self.submits += 1
+                raise RuntimeError("unknown outcome")
+            def find_job(self, task_id):
+                if self.value == "raise": raise RuntimeError("private detail")
+                return self.value
+            def poll(self, job_id): raise AssertionError("must not poll invalid handle")
+        adapter = Adapter()
+        c = Coordinator(self.db, {"grok": adapter})
+        c.submit("grok", "task", "key")
+        for value in (None, "", "x" * 257, 42, "raise"):
+            with self.subTest(value=value):
+                adapter.value = value
+                response = c.result("grok", "key")
+                self.assertEqual(response["status"], "submission_uncertain")
+                self.assertIsNone(response["job_id"])
+                self.assertNotIn("private detail", str(response))
+        self.assertEqual(adapter.submits, 1)
+
+    def test_recovery_during_active_dispatch_keeps_original_job_and_terminal_result(self):
+        entered, release = threading.Event(), threading.Event()
+        class Adapter:
+            def __init__(self): self.submits = 0; self.task_id = None
+            def submit(self, *, task, task_id):
+                self.submits += 1
+                self.task_id = task_id
+                entered.set()
+                if not release.wait(3): raise TimeoutError()
+                return {"status": "queued", "job_id": "worker-1"}
+            def find_job(self, task_id):
+                return "worker-1" if task_id == self.task_id else None
+            def poll(self, job_id): return {"status": "succeeded", "output": "done"}
+        adapter = Adapter()
+        c = Coordinator(self.db, {"grok": adapter})
+        thread = threading.Thread(target=lambda: c.submit("grok", "task", "key"))
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(3))
+            self.assertEqual(c.result("grok", "key")["output"], "done")
+        finally:
+            release.set()
+            thread.join(3)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(c.get("key")["status"], "succeeded")
+        self.assertEqual(c.get("key")["job_id"], "worker-1")
         self.assertEqual(adapter.submits, 1)
 
     def test_existing_job_reported_as_not_submitted_is_reconciled_conservatively(self):

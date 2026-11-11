@@ -116,7 +116,7 @@ class Coordinator:
                         method = value.get("authMethod")
                         if method in ("oauth", "claude.ai", "subscription", "cached_token", "api_key", "unknown"):
                             safe["authMethod"] = method
-                        for key in ("local_active", "local_limit", "local_active_jobs", "local_max_concurrency", "local_available_slots"):
+                        for key in ("local_active", "local_limit", "local_active_jobs", "local_max_concurrency", "local_available_slots", "local_observed_inflight", "local_uncertain"):
                             count = value.get(key)
                             if type(count) is int and 0 <= count <= 1000:
                                 safe[key] = count
@@ -226,9 +226,32 @@ class Coordinator:
             return current
         if current.get("provider") != provider:
             raise InputError("provider does not match request")
-        if current.get("status") == "not_submitted" or not current.get("job_id"):
+        if current.get("status") == "not_submitted":
             return current
         adapter = self.adapters.get(provider)
+        if not current.get("job_id") and current.get("status") == "submission_uncertain":
+            # An adapter can have durably recorded an original job after the
+            # coordinator reserved task_id but before it received job_id.
+            # Resolve only through the adapter's read-only lookup; never call
+            # submit or infer that a missing record means no dispatch occurred.
+            find_job = getattr(adapter, "find_job", None) if adapter is not None else None
+            if callable(find_job):
+                try:
+                    recovered = find_job(current["task_id"])
+                except Exception:
+                    recovered = None
+                if isinstance(recovered, str) and recovered and len(recovered) <= 256:
+                    with self._db() as conn:
+                        conn.execute("UPDATE requests SET job_id = ?, status = CASE WHEN status = 'dispatching' "
+                                     "THEN 'submission_uncertain' ELSE status END WHERE request_key = ? "
+                                     "AND provider = ? AND task_id = ? AND job_id IS NULL "
+                                     "AND status IN ('dispatching', 'submission_uncertain')",
+                                     (recovered, request_key, provider, current["task_id"]))
+                    # A concurrent submit/poll may have updated the record;
+                    # use the ledger's actual value, never overwrite it here.
+                    current = self.get(request_key)
+        if not current.get("job_id"):
+            return current
         poll = getattr(adapter, "poll", None) if adapter is not None else None
         if not callable(poll):
             return _result_unavailable(current, "adapter_unavailable")

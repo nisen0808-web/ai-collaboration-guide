@@ -115,6 +115,39 @@ class DurableTests(unittest.TestCase):
     def test_unknown_job_is_uncertain(self):
         self.assertEqual(self.adapter().poll("not-a-job")["status"], "submission_uncertain")
 
+    def test_find_job_reads_existing_mapping_without_starting(self):
+        adapter = self.adapter()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)) as launch:
+            result = adapter.submit("synthetic task", "task-1")
+            self.assertEqual(adapter.find_job("task-1"), result["job_id"])
+            self.assertIsNone(adapter.find_job("missing"))
+            self.assertIsNone(adapter.find_job("\ud800"))
+            self.assertEqual(launch.call_count, 1)
+
+    def test_status_distinguishes_live_identity_from_unknown_without_releasing(self):
+        adapter = self.adapter(max_concurrency=2)
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)):
+            first = adapter.submit("task one", "task-1")
+            second = adapter.submit("task two", "task-2")
+        with adapter.ledger._connect() as con:
+            con.execute("UPDATE jobs SET state='running',worker_pid=?,worker_identity=? WHERE job_id=?",
+                        (123, "confirmed-identity", first["job_id"]))
+        with mock.patch.object(subject, "_process_identity", return_value="confirmed-identity"):
+            status = adapter.status()
+        self.assertEqual(status["local_active_jobs"], 2)
+        self.assertEqual(status["local_observed_inflight"], 1)
+        self.assertEqual(status["local_uncertain"], 1)
+        self.assertEqual(status["local_available_slots"], 0)
+        self.assertEqual(adapter.submit("third", "task-3")["reason"], "provider_busy")
+
+    def test_request_write_failure_before_spawn_releases_slot(self):
+        adapter = self.adapter()
+        with mock.patch.object(adapter.ledger, "write_request", side_effect=OSError("synthetic failure")), \
+             mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("started")):
+            result = adapter.submit("task", "task-1")
+        self.assertEqual(result["status"], "not_submitted")
+        self.assertEqual(adapter.status()["local_available_slots"], 1)
+
     def test_worker_survives_actual_launcher_exit_then_new_adapter_polls(self):
         # This starts only synthetic Python processes, never the Grok CLI.
         fake = self.base / "fake_detached_worker.py"

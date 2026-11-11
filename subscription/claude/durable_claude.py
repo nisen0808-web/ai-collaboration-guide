@@ -94,10 +94,28 @@ class DurableClaudeAdapter:
 
     def status(self) -> dict:
         with _connect(self.db) as con:
-            n = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchone()[0]
+            rows = con.execute("SELECT status,heartbeat FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchall()
+        # A recent heartbeat is a local observation, not proof that a worker
+        # or its provider child is alive. Uncertain rows continue to own slots.
+        now = time.time()
+        observed = sum(row[0] in ("queued", "running") and row[1] is not None
+                       and 0 <= now - row[1] <= 10 for row in rows)
+        n = len(rows)
         return {"provider": "claude", "configured": self.enabled, "ready": None,
                 "verification": "not_verified", "local_active": n,
+                "local_observed_inflight": observed, "local_uncertain": n - observed,
                 "local_limit": self.max_concurrency}
+
+    def find_job(self, task_id: str) -> str | None:
+        """Return an existing job handle without launching or retrying work."""
+        if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
+            return None
+        try:
+            with _connect(self.db) as con:
+                row = con.execute("SELECT id FROM jobs WHERE id=?", (task_id,)).fetchone()
+        except (OSError, sqlite3.Error):
+            return None
+        return row[0] if row else None
 
     def submit(self, task: str, task_id: str) -> dict:
         if not self.enabled:
@@ -135,6 +153,12 @@ class DurableClaudeAdapter:
                                            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
             else:
                 kwargs["start_new_session"] = True
+        except Exception:
+            # No process launch was attempted, so this reservation can safely
+            # stop occupying a slot. Keep the task record to prevent replays.
+            self._set_if_reserved(task_id, "failed", "worker_setup_failed")
+            return {"status": "not_submitted", "reason": "worker_unavailable"}
+        try:
             process = subprocess.Popen([sys.executable, _WORKER_SCRIPT, "--worker", str(self.state_dir), task_id], **kwargs)
         except Exception:
             # A spawn error alone is not a durable proof that no worker was

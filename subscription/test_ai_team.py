@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import json
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
 from pathlib import Path
 import subprocess
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -44,6 +45,39 @@ class EntryPointTests(unittest.TestCase):
                  patch.object(ai_team, "ClaudeAdapter", side_effect=ValueError("invalid")), \
                  patch.object(ai_team, "GrokAdapter"):
                 self.assertEqual(set(ai_team.build_adapters(args)), {"grok"})
+
+    def test_broken_provider_database_does_not_block_the_other(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = ai_team.parser().parse_args(["serve", "--data-dir", tmp])
+            for failed, available in (("ClaudeAdapter", "grok"), ("GrokAdapter", "claude")):
+                with self.subTest(failed=failed), \
+                     patch.object(ai_team, "executable", return_value="/synthetic/client"), \
+                     patch.object(ai_team, "ClaudeAdapter") as claude, \
+                     patch.object(ai_team, "GrokAdapter") as grok:
+                    (claude if failed == "ClaudeAdapter" else grok).side_effect = sqlite3.DatabaseError("private path")
+                    self.assertEqual(set(ai_team.build_adapters(args)), {available})
+
+    def test_coordinator_database_error_does_not_print_details(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with patch.object(ai_team, "build_adapters", return_value={}), \
+                 patch.object(ai_team, "Coordinator", side_effect=sqlite3.DatabaseError("private path")), \
+                 redirect_stderr(stderr):
+                self.assertEqual(ai_team.main(["serve", "--data-dir", tmp]), 1)
+            self.assertIn("Unable to start", stderr.getvalue())
+            self.assertNotIn("private path", stderr.getvalue())
+            self.assertNotIn(tmp, stderr.getvalue())
+
+    def test_unexpected_service_error_does_not_print_details(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with patch.object(ai_team, "build_adapters", return_value={}), \
+                 patch.object(ai_team, "Coordinator"), \
+                 patch.object(ai_team, "serve", side_effect=RuntimeError("private path")), \
+                 redirect_stderr(stderr):
+                self.assertEqual(ai_team.main(["serve", "--data-dir", tmp]), 1)
+            self.assertNotIn("private path", stderr.getvalue())
+            self.assertNotIn(tmp, stderr.getvalue())
 
     def test_existing_profiles_are_used_only_when_explicitly_selected(self):
         with tempfile.TemporaryDirectory() as tmp:
