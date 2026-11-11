@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.db
+*.sqlite*
+*.log
+*credentials*
+*token*
+*secret*
+jobs/
+state/
+profiles/

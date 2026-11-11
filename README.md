@@ -1,5 +1,9 @@
 # AI 多模型协作：最小参考实现
 
+## 官方客户端登录协作（开发候选）
+
+如果希望让 Codex 通过各自的官方客户端协调 Claude 和 Grok，请看 [客户端协作候选](subscription/README.md)。这一部分仍在开发，尚未完成真实账号联调；下面原有的 API 示例独立保留。
+
 [![离线测试](../../actions/workflows/ci.yml/badge.svg?branch=main&event=push)](../../actions/workflows/ci.yml)
 
 徽章显示主分支最近一次推送的自动测试状态；它不代表真实 API 连接已经验证。
