@@ -27,6 +27,12 @@ result unavailable; this has not been tested against a real provider. Process
 exit and response text do not prove model or reasoning effort; those fields are
 explicitly marked unverified.
 
+On Windows, one short task using this candidate returned the expected answer
+after subsequent code changes. The candidate reported quality as unverified;
+no official record was obtained to independently confirm the actual model or
+effort for that task. This does not establish reliability on other systems,
+accounts or tasks.
+
 The local adapter defaults to at most two active Claude jobs; callers can choose
 another bounded local limit. A busy adapter reports `not_submitted`, and replay
 of an existing task ID does not start a second job. This local limit is not a
