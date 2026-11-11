@@ -2,7 +2,7 @@
 
 ## 官方客户端登录协作（开发候选）
 
-如果希望让 Codex 通过各自的官方客户端协调 Claude 和 Grok，请看 [客户端协作候选](subscription/README.md)。这一部分仍在开发，两家的简短真实任务各完成一次，但样本执行后代码又有修改；部分实际模型与思考强度仍缺少可核验证据，跨平台和异常恢复未完全验证。下面的 API 示例独立保留。
+如果希望让 Codex 通过各自的官方客户端协调 Claude 和 Grok，请看 [客户端协作候选](subscription/README.md)。这一部分仍在开发：两家此前的简短真实任务结果正确；更新后的 Python 代码又在禁用随包技能的独立测试配置中完成了一次 Grok 测试，其模型和思考强度由主控事后核对，工具本身仍标记未验证。Claude 样本早于后续代码修改，实际模型与强度缺少可核验证据。跨平台和异常恢复未完全验证。下面的 API 示例独立保留。
 
 [![离线测试](../../actions/workflows/ci.yml/badge.svg?branch=main&event=push)](../../actions/workflows/ci.yml)
 
