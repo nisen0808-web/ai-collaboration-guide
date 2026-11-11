@@ -13,9 +13,11 @@ the adapter does not automatically resubmit an uncertain task or switch APIs.
 returns its state. By default this adapter allows two local Grok jobs at once;
 this is a local bound, not a statement about official account capacity. A full
 adapter returns `not_submitted/provider_busy`; another provider is unaffected.
-The CLI's own inspection can find extensions and default
-bundled skills: this candidate rejects every nonempty list and may therefore
-reject legitimate setups. Only one CLI version's flags informed this candidate.
+The CLI's own inspection can find extensions and default bundled skills. The
+candidate permits explicitly identified built-in agents only when subagents
+are disabled, and conservatively rejects other unexpected or unknown entries;
+some legitimate setups may therefore be rejected. Inspection metadata is
+marked unverified. Only one CLI version's flags informed this candidate.
 The user must explicitly select and verify the official executable and model.
 
 Important limitations before release: this implementation uses temporary task
@@ -27,10 +29,11 @@ its task/output files are preserved and its status is `submission_uncertain`.
 While this host process remains alive, its worker continues waiting on the same
 original child and can collect the eventual outcome without a second request.
 In-memory job tracking is lost when the hosting process exits and unknown jobs
-remain uncertain. There is no automatic process kill or retry. Real login,
-official CLI compatibility, Windows behavior, privacy and subscription billing
-have not been tested. Do not publish or use with real tasks until these issues
-are resolved and independently reviewed.
+remain uncertain. There is no automatic process kill or retry. One official
+CLI version's help and a read-only inspection have been checked on Windows;
+actual Grok generation and other CLI versions have not yet been verified. This
+does not establish privacy, billing or cross-platform compatibility. Do not use
+this candidate for real tasks until it has been independently reviewed.
 
 `durable_grok.py` provides a separate detached-worker candidate using an
 explicit, existing tool-owned state directory. It reserves each task in SQLite

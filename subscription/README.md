@@ -17,7 +17,6 @@
 ```text
 python ai_team.py login claude
 python ai_team.py login grok
-python ai_team.py install
 ```
 
 这会分别打开官方客户端的登录流程，登录信息由官方客户端保存。默认使用项目专用的本机数据目录；不会复制其他客户端已有的登录文件。如果希望使用已经登录的官方客户端配置，也可以显式设置 `--claude-profile` 或 `--grok-profile` 指向各自现有的配置目录，CLI 将自行读取其配置，不需要复制令牌。客户端未在系统路径时，可用 `--claude-cli` 或 `--grok-cli` 指定其位置。
@@ -37,6 +36,14 @@ python /absolute/path/to/ai_team.py serve
 例如，Codex 的 CLI 支持 `codex mcp add <名称> -- <服务器命令>`；桌面应用也可在 MCP 设置中添加本地服务。替换命令中的路径，并在添加后按客户端提示重启连接。[Codex MCP 文档](https://learn.chatgpt.com/docs/extend/mcp?surface=cli)
 
 模型和思考强度可通过 `--claude-model`、`--grok-model`、`--claude-effort` 和 `--grok-effort` 调整；默认值只是通用起点，实际可用性以各自账号与客户端为准。两家服务的用量、订阅和可能产生的费用由使用者自己的账号管理。
+
+安装前请用官方客户端列出当前账号可用模型，并在 `install` 命令中通过 `--grok-model` 显式选择其中一个。一次只读检查中，默认的 `grok-build` 名称没有出现在模型列表里；这不能证明它一定无效，也不能证明其他账号可用相同模型。模型出现在列表中不等于已通过真实任务测试。
+
+例如，先运行 `grok models`，再将下面的 `可用模型名` 替换为列表中的名称并安装：
+
+```text
+python ai_team.py install --grok-model 可用模型名
+```
 
 Claude Code 需支持 `--permission-prompts`（官方说明为 2.1.259 或更新版本）；使用前请先检查版本。官方还提示未来可能调整 `-p` 的默认启动模式，届时需重新验证已登录账号的兼容性。本机已核对 Grok 1.0.52 的实际帮助中包含本工具使用的命令参数，不代表其他版本已验证。[Claude CLI 参考](https://code.claude.com/docs/en/cli-reference) · [Claude 程序化运行](https://code.claude.com/docs/en/headless) · [Grok CLI 参考](https://docs.x.ai/build/cli/reference)
 
