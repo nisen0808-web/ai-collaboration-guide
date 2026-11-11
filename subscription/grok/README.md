@@ -30,10 +30,14 @@ While this host process remains alive, its worker continues waiting on the same
 original child and can collect the eventual outcome without a second request.
 In-memory job tracking is lost when the hosting process exits and unknown jobs
 remain uncertain. There is no automatic process kill or retry. One official
-CLI version's help and a read-only inspection have been checked on Windows;
-actual Grok generation and other CLI versions have not yet been verified. This
-does not establish privacy, billing or cross-platform compatibility. Do not use
-this candidate for real tasks until it has been independently reviewed.
+CLI version's help and a read-only inspection have been checked on Windows.
+One short real task returned the expected answer. The exact official session
+summary recorded `grok-4.7` and `xhigh`; its usage recorded `grok-4.7-build`.
+The coordinator separately checked these records against its quality policy;
+this candidate still reports quality as unverified and cannot perform that
+check automatically. Other CLI versions have not been checked. This does not establish privacy, billing or cross-platform
+compatibility. Do not use this candidate for real tasks until it has been
+independently reviewed.
 
 `durable_grok.py` provides a separate detached-worker candidate using an
 explicit, existing tool-owned state directory. It reserves each task in SQLite

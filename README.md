@@ -2,11 +2,11 @@
 
 ## 官方客户端登录协作（开发候选）
 
-如果希望让 Codex 通过各自的官方客户端协调 Claude 和 Grok，请看 [客户端协作候选](subscription/README.md)。这一部分仍在开发，尚未完成真实账号联调；下面原有的 API 示例独立保留。
+如果希望让 Codex 通过各自的官方客户端协调 Claude 和 Grok，请看 [客户端协作候选](subscription/README.md)。这一部分仍在开发，两家的简短真实任务各完成一次；部分实际模型与思考强度仍缺少可核验证据，跨平台和异常恢复未完全验证。下面的 API 示例独立保留。
 
 [![离线测试](../../actions/workflows/ci.yml/badge.svg?branch=main&event=push)](../../actions/workflows/ci.yml)
 
-徽章显示主分支最近一次推送的自动测试状态；它不代表真实 API 连接已经验证。
+徽章显示主分支最近一次推送的 API 示例离线测试状态；它不覆盖客户端协作候选，也不代表真实 API 连接已经验证。
 
 把一个问题分别交给 Claude 和 Grok，再由你或主控 AI 对照、核验结果。程序只依赖 Python 标准库；任何具备终端执行能力的 AI 都可以帮助使用。
 
@@ -128,9 +128,9 @@ python -m unittest -v test_collaborate test_preflight test_api test_errors
 
 **必须：** 只发送必要资料；不分享凭据；独立输入；不自动重试提交不明或失败的请求；如实报告缺失结果、输出截断和不可验证的信息。实际模型能力、权限、额度和费用以本人账户及官方记录为准。
 
-**进阶：** 可在此基础上自行增加 MCP、任务持久化或其他模型；这些不属于当前示例。Codex 仍可作为**客户端**连接外部 MCP 服务。旧的 `codex mcp-server` 则已被移除；迁移路径是 Codex app server，它不是 MCP 的直接替代，并且官方称其目前为实验性方案。[Codex MCP 客户端](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) · [移除与迁移说明](https://learn.chatgpt.com/docs/mcp-server)
+**进阶：** 可在 API 示例基础上自行增加 MCP、任务持久化或其他模型；这些不属于 API 示例。仓库另有独立的[客户端协作候选](subscription/README.md)。Codex 仍可作为**客户端**连接外部 MCP 服务。旧的 `codex mcp-server` 则已被移除；迁移路径是 Codex app server，它不是 MCP 的直接替代，并且官方称其目前为实验性方案。[Codex MCP 客户端](https://learn.chatgpt.com/docs/extend/mcp?surface=cli) · [移除与迁移说明](https://learn.chatgpt.com/docs/mcp-server)
 
-Claude Code 和 Grok Build 均有官方非交互客户端，但账号权益、自动化与第三方产品条款需分别核验；本示例未实现订阅 CLI 适配。[Claude Code 条款](https://code.claude.com/docs/en/legal-and-compliance) · [Grok Build](https://docs.x.ai/build/overview)
+Claude Code 和 Grok Build 均有官方非交互客户端，但账号权益、自动化与第三方产品条款需分别核验；本节的 API 示例不使用订阅 CLI，另见客户端协作候选。[Claude Code 条款](https://code.claude.com/docs/en/legal-and-compliance) · [Grok Build](https://docs.x.ai/build/overview)
 
 ## 删除与许可
 
