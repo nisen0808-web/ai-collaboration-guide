@@ -20,10 +20,10 @@ import tempfile
 import uuid
 
 if __package__:
-    from .grok_adapter import GrokAdapter, _MAX_TASK_BYTES
+    from .grok_adapter import GrokAdapter, _MAX_TASK_BYTES, _NETWORK_ENV_NAMES
 else:
     # The detached worker executes this file directly.
-    from grok_adapter import GrokAdapter, _MAX_TASK_BYTES
+    from grok_adapter import GrokAdapter, _MAX_TASK_BYTES, _NETWORK_ENV_NAMES
 
 
 _ACTIVE = ("dispatching", "queued", "running", "submission_uncertain")
@@ -160,9 +160,14 @@ class _Ledger:
     def store(self, job_id: str, state: dict) -> None:
         # Store full results only under user-selected state_root, never stdout.
         text = json.dumps(state, ensure_ascii=True)
+        # The remote outcome can remain unknown even after the direct local
+        # CLI process exited. Keep the original result/status for polling,
+        # but do not reserve a local execution slot for that finished process.
+        durable_state = ("finished_uncertain" if state.get("status") == "submission_uncertain"
+                         and state.get("local_exit_confirmed") is True else state["status"])
         with self._connect() as con:
             con.execute("UPDATE jobs SET state=?, result_json=? WHERE job_id=?",
-                        (state["status"], text, job_id))
+                        (durable_state, text, job_id))
 
     def mark_start_uncertain_if_unclaimed(self, job_id: str) -> None:
         state = {"status": "submission_uncertain", "job_id": job_id,
@@ -224,9 +229,11 @@ def _worker_command(root: Path, job_id: str) -> list[str]:
 
 
 def _worker_env() -> dict[str, str]:
-    # Only these baseline variables are inherited; no key/config values.
-    names = ("PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR")
-    return {name: value for name in names if isinstance((value := os.environ.get(name)), str)}
+    # Network settings may contain sensitive proxy URLs; never log values.
+    # API key and provider config variables remain excluded.
+    names = ("PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR") + _NETWORK_ENV_NAMES
+    return {name: value for name in names
+            if isinstance((value := os.environ.get(name)), str) and "\0" not in value}
 
 
 class DurableGrokAdapter:
@@ -269,6 +276,13 @@ class DurableGrokAdapter:
             return {"status": "not_submitted", "reason": "task_id_conflict"}
         if result == "existing":
             old = self.poll(job_id)
+            if old.get("status") == "not_submitted" and old.get("reason") == "state_write_failed":
+                # This exact persisted state is written only before any worker
+                # launch is attempted. Preserve the truthful outcome without
+                # launching again or implying an earlier provider submission.
+                # Omit job_id so the coordinator does not treat it as a
+                # possibly submitted provider job.
+                return {"status": "not_submitted", "reason": "state_write_failed", "replayed": True}
             if old["status"] not in _ACTIVE:
                 return {"status": "not_submitted", "reason": "already_submitted", "job_id": job_id, "replayed": True}
             return {"status": old["status"], "job_id": job_id, "replayed": True}
@@ -282,7 +296,10 @@ class DurableGrokAdapter:
                 self.ledger.store(job_id, {"status": "not_submitted", "job_id": job_id, "reason": "state_write_failed"})
             except (OSError, sqlite3.Error):
                 pass  # No worker was launched; stale reservation stays conservative.
-            return {"status": "not_submitted", "reason": "state_write_failed", "job_id": job_id}
+            # No worker launch was attempted. Do not expose this local
+            # reservation as a provider job handle: the coordinator treats
+            # a handle as evidence that submission may have occurred.
+            return {"status": "not_submitted", "reason": "state_write_failed"}
         options = {"cwd": str(self.ledger.root), "env": _worker_env(), "stdin": subprocess.DEVNULL,
                    "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "shell": False, "close_fds": True}
         if os.name == "nt":
@@ -316,8 +333,11 @@ class DurableGrokAdapter:
     def status(self) -> dict:
         observed, uncertain = self.ledger.occupancy()
         active = observed + uncertain
+        with self.ledger._connect() as con:
+            finished_unresolved = con.execute("SELECT COUNT(*) FROM jobs WHERE state='finished_uncertain'").fetchone()[0]
         return {"provider": "grok", "local_active_jobs": active, "local_max_concurrency": self.max_concurrency,
                 "local_observed_inflight": observed, "local_uncertain": uncertain,
+                "local_finished_unresolved": finished_unresolved,
                 "local_available_slots": max(0, self.max_concurrency - active), "official_quota_verified": False,
                 "login_verified": False}
 

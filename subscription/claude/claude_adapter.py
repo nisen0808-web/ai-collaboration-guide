@@ -18,7 +18,10 @@ import threading
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\Z")
 _TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
 _EFFORTS = frozenset({"low", "medium", "high", "max"})
-_INHERIT = frozenset({"PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR"})
+_NETWORK_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                      "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                      "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR")
+_INHERIT = frozenset({"PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR", *_NETWORK_ENV_NAMES})
 _CLAUDE_ACCOUNT = frozenset({"claude.ai", "claude_ai", "claudeai", "claude.ai oauth", "claude.ai/oauth"})
 _PLANS = frozenset({"free", "pro", "max", "ultra", "team", "enterprise", "claude_pro", "claude_max",
                     "default_claude_pro", "default_claude_max_5x", "default_claude_max_20x", "max5x", "max20x"})
@@ -34,10 +37,11 @@ def _absolute(path) -> str:
 
 
 def child_environment(source: Mapping, profile_dir: str, work_dir: str) -> dict[str, str]:
-    """Allowlist non-secret launch variables; never inspect API key variables.
+    """Allowlist launch variables; never inspect API key variables.
 
     CLI configuration, managed policy and account settings can still affect
     billing. This function does not claim to verify a request's billing route.
+    Proxy settings may themselves contain credentials and must not be logged.
     """
     if not isinstance(source, Mapping):
         raise TypeError("source must be a mapping")
@@ -192,8 +196,9 @@ class ClaudeAdapter:
 
         # This is the first potential model submission. Never retry after here.
         command = [self.cli_path, "-p", "--model", self.model, "--effort", self.effort,
-                   "--output-format", "json", "--tools", "", "--permission-prompts", "none",
+                   "--output-format", "json", "--no-session-persistence", "--tools", "", "--permission-prompts", "none",
                    "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+        process_exit_confirmed = False
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                        stderr=subprocess.PIPE, cwd=self.work_dir, env=env,
@@ -206,19 +211,41 @@ class ClaudeAdapter:
                 # same process, without terminating it or re-submitting input.
                 self._update(job_id, status="submission_uncertain", error="provider_slow")
                 stdout, _stderr = process.communicate()
-            if process.returncode != 0:
-                self._update(job_id, status="submission_uncertain", error="provider_process_failed")
+            # communicate() returning with a known return code establishes
+            # that this local CLI process has exited, but not whether the
+            # service received or completed the request. Keep those facts
+            # separate so another task need not wait on a dead local process.
+            process_exit_confirmed = type(process.returncode) is int
+            # A structured CLI error is a known failure even if the process
+            # exits nonzero. Never forward its body, which may contain secrets.
+            # Other nonzero, malformed, or incomplete results stay uncertain.
+            try:
+                payload = json.loads(stdout)
+            except (TypeError, ValueError):
+                payload = None
+            if isinstance(payload, dict) and payload.get("is_error") is True:
+                self._update(job_id, status="failed" if process_exit_confirmed else "submission_uncertain",
+                             error="provider_reported_error",
+                             local_exit_confirmed=process_exit_confirmed)
                 return
-            payload = json.loads(stdout)
+            if process.returncode != 0:
+                self._update(job_id, status="submission_uncertain", error="provider_process_failed",
+                             local_exit_confirmed=process_exit_confirmed)
+                return
             if not isinstance(payload, dict) or not isinstance(payload.get("result"), str):
-                self._update(job_id, status="submission_uncertain", error="invalid_provider_response")
+                self._update(job_id, status="submission_uncertain", error="invalid_provider_response",
+                             local_exit_confirmed=process_exit_confirmed)
                 return
             if payload.get("is_error") is not False:
-                self._update(job_id, status="failed", error="provider_reported_error")
+                self._update(job_id, status="submission_uncertain", error="invalid_provider_response",
+                             local_exit_confirmed=process_exit_confirmed)
                 return
             self._update(job_id, status="succeeded", output=payload["result"],
-                         model_verification="unverified", effort_verification="unverified")
+                         model_verification="unverified", effort_verification="unverified",
+                         local_exit_confirmed=process_exit_confirmed)
         except (OSError, ValueError, subprocess.TimeoutExpired):
-            self._update(job_id, status="submission_uncertain", error="provider_result_unavailable")
+            self._update(job_id, status="submission_uncertain", error="provider_result_unavailable",
+                         local_exit_confirmed=process_exit_confirmed)
         except Exception:
-            self._update(job_id, status="submission_uncertain", error="provider_result_unavailable")
+            self._update(job_id, status="submission_uncertain", error="provider_result_unavailable",
+                         local_exit_confirmed=process_exit_confirmed)

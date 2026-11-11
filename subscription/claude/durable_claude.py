@@ -95,6 +95,7 @@ class DurableClaudeAdapter:
     def status(self) -> dict:
         with _connect(self.db) as con:
             rows = con.execute("SELECT status,heartbeat FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchall()
+            finished_unresolved = con.execute("SELECT COUNT(*) FROM jobs WHERE status='finished_uncertain'").fetchone()[0]
         # A recent heartbeat is a local observation, not proof that a worker
         # or its provider child is alive. Uncertain rows continue to own slots.
         now = time.time()
@@ -104,6 +105,7 @@ class DurableClaudeAdapter:
         return {"provider": "claude", "configured": self.enabled, "ready": None,
                 "verification": "not_verified", "local_active": n,
                 "local_observed_inflight": observed, "local_uncertain": n - observed,
+                "local_finished_unresolved": finished_unresolved,
                 "local_limit": self.max_concurrency}
 
     def find_job(self, task_id: str) -> str | None:
@@ -137,7 +139,7 @@ class DurableClaudeAdapter:
                     if heartbeat is None or not 0 <= time.time() - heartbeat <= 10:
                         prior = "submission_uncertain"
                     return {"status": prior, "job_id": task_id, "replayed": True}
-                if prior in ("reserved", "submission_uncertain"):
+                if prior in ("reserved", "submission_uncertain", "finished_uncertain"):
                     return {"status": "submission_uncertain", "job_id": task_id, "replayed": True}
                 # This invocation did not start new work. Return the handle
                 # of the original terminal record so callers can poll it; do
@@ -222,6 +224,11 @@ class DurableClaudeAdapter:
         if row is None:
             return {"status": "submission_uncertain", "error": "unknown_job"}
         status, error, heartbeat, output_file = row
+        if status == "finished_uncertain":
+            # Local CLI exit is confirmed, but the remote outcome is not.
+            # It does not occupy a live local slot and cannot be re-sent.
+            return {"status": "submission_uncertain", "error": error,
+                    "local_exit_confirmed": True}
         if status == "succeeded":
             # Only the expected fixed filename inside the private state root is
             # accepted. A missing/corrupt output does not authorize a retry.
@@ -267,21 +274,40 @@ def _run_worker(state_dir: str, job_id: str) -> None:
                                 timeout_seconds=message["timeout_seconds"], max_concurrency=1)
         receipt = adapter.submit(task, job_id)
         if receipt.get("status") != "queued":
-            update("failed", "worker_unavailable")
+            # An uncertain receipt may represent a real submission: preserve
+            # its slot and ID rather than falsely marking it as failed.
+            if receipt.get("status") == "not_submitted":
+                update("failed", "worker_unavailable")
+            else:
+                update("submission_uncertain", "worker_unavailable")
             return
         while True:
             result = adapter.poll(job_id)
             status = result.get("status")
             if status == "succeeded":
                 filename = job_id + ".result.json"
-                _atomic_json(state / filename, {"output": result["output"]})
+                try:
+                    _atomic_json(state / filename, {"output": result["output"]})
+                except Exception:
+                    # A completed provider result could not be saved. Never
+                    # expose it as a usable result or launch the job again.
+                    # Free only the local slot when this precise response
+                    # carries explicit evidence of the CLI process exit.
+                    durable_status = ("finished_uncertain" if result.get("local_exit_confirmed") is True
+                                      else "submission_uncertain")
+                    update(durable_status, "result_unavailable")
+                    return
                 update("succeeded", output_file=filename)
                 return
             if status == "failed":
                 update("failed", result.get("error"))
                 return
             if status == "submission_uncertain" and result.get("error") != "provider_slow":
-                update("submission_uncertain", result.get("error"))
+                # Only an explicit, verified local exit can free this local
+                # slot. The remote result remains unknown and is never retried.
+                durable_status = ("finished_uncertain" if result.get("local_exit_confirmed") is True
+                                  else "submission_uncertain")
+                update(durable_status, result.get("error"))
                 return
             update("submission_uncertain" if status == "submission_uncertain" else "running", result.get("error"))
             time.sleep(1)

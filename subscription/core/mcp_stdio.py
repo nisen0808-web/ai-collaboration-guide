@@ -1,7 +1,7 @@
 """Minimal stdio MCP front end for the portable ledger.
 
-This preview has no provider adapters. It cannot call Claude or Grok.
-State location must be explicitly chosen with --db.
+The standalone entry point has no provider adapters. The main ai_team.py
+entry point supplies them and uses a separate local state directory.
 """
 
 from __future__ import annotations

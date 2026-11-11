@@ -30,6 +30,21 @@ class DurableTests(unittest.TestCase):
         return subject.DurableGrokAdapter(str(self.cli), "example-model", "high", str(self.profile),
                                           str(self.root), 2, max_concurrency)
 
+    def test_worker_passes_synthetic_network_settings_but_not_api_key(self):
+        synthetic = {"HTTPS_PROXY": "http://example.invalid:8080",
+                     "NODE_EXTRA_CA_CERTS": "synthetic-ca-path",
+                     "XAI_API_KEY": "synthetic-key"}
+        with mock.patch.dict(os.environ, synthetic, clear=True):
+            env = subject._worker_env()
+        self.assertEqual(env.get("HTTPS_PROXY"), synthetic["HTTPS_PROXY"])
+        self.assertEqual(env.get("NODE_EXTRA_CA_CERTS"), synthetic["NODE_EXTRA_CA_CERTS"])
+        self.assertNotIn("XAI_API_KEY", env)
+
+    def test_worker_omits_invalid_synthetic_network_value(self):
+        with mock.patch.object(subject.os, "environ", {"HTTPS_PROXY": "invalid\0value"}):
+            env = subject._worker_env()
+        self.assertNotIn("HTTPS_PROXY", env)
+
     def test_atomic_reservation_survives_new_adapter_and_no_key_is_passed(self):
         first = self.adapter()
         second = self.adapter()
@@ -70,10 +85,11 @@ class DurableTests(unittest.TestCase):
 
     def test_detached_fake_worker_result_survives_new_adapter_instance(self):
         fake = self.base / "fake_worker.py"
-        fake.write_text('''import sys, time\nsys.path.insert(0, sys.argv[1])\nimport durable_grok\ndef fake_execute(self, job_id, task):\n    self._update(job_id, status="running", phase="synthetic")\n    self._update(job_id, status="submission_uncertain", error="process_still_running")\n    time.sleep(0.6)\n    self._update(job_id, status="succeeded", output="synthetic result", error=None)\ndurable_grok.GrokAdapter._execute = fake_execute\nraise SystemExit(durable_grok.worker_main(sys.argv[2], sys.argv[3]))\n''', encoding="utf-8")
+        fake.write_text('''import sys, time\nfrom pathlib import Path\nsys.path.insert(0, sys.argv[1])\nimport durable_grok\ndef fake_execute(self, job_id, task):\n    self._update(job_id, status="running", phase="synthetic")\n    self._update(job_id, status="submission_uncertain", error="process_still_running")\n    deadline = time.monotonic() + 8\n    while not Path(sys.argv[4]).exists() and time.monotonic() < deadline:\n        time.sleep(0.01)\n    self._update(job_id, status="succeeded", output="synthetic result", error=None)\ndurable_grok.GrokAdapter._execute = fake_execute\nraise SystemExit(durable_grok.worker_main(sys.argv[2], sys.argv[3]))\n''', encoding="utf-8")
         module_dir = str(Path(subject.__file__).resolve().parent)
+        release = self.base / "release-fake-worker"
         def fake_command(root, job_id):
-            return [sys.executable, str(fake), module_dir, str(root), job_id]
+            return [sys.executable, str(fake), module_dir, str(root), job_id, str(release)]
         first = self.adapter()
         spawned = []
         real_popen = subprocess.Popen
@@ -92,11 +108,12 @@ class DurableTests(unittest.TestCase):
             saw_worker_uncertain = False
             while time.monotonic() < deadline:
                 state = second.poll(job_id)
-                if state.get("error") == "process_still_running":
+                if state.get("error") == "process_still_running" and not saw_worker_uncertain:
                     saw_worker_uncertain = True
                     self.assertEqual(second.status()["local_available_slots"], 0)
                     replay = second.submit("synthetic private task", "task-1")
                     self.assertEqual(replay["job_id"], job_id)
+                    release.touch()
                 if state["status"] == "succeeded":
                     break
                 time.sleep(0.03)
@@ -143,10 +160,66 @@ class DurableTests(unittest.TestCase):
     def test_request_write_failure_before_spawn_releases_slot(self):
         adapter = self.adapter()
         with mock.patch.object(adapter.ledger, "write_request", side_effect=OSError("synthetic failure")), \
-             mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("started")):
+             mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("started")) as launch:
             result = adapter.submit("task", "task-1")
+            replay = adapter.submit("task", "task-1")
+            replay_after_restart = self.adapter().submit("task", "task-1")
+            conflict = adapter.submit("different task", "task-1")
+            launch.assert_not_called()
         self.assertEqual(result["status"], "not_submitted")
+        self.assertEqual(result["reason"], "state_write_failed")
+        self.assertNotIn("job_id", result)
+        for item in (replay, replay_after_restart):
+            self.assertEqual(item["status"], "not_submitted")
+            self.assertEqual(item["reason"], "state_write_failed")
+            self.assertTrue(item["replayed"])
+            self.assertNotIn("job_id", item)
+        self.assertEqual(conflict["reason"], "task_id_conflict")
         self.assertEqual(adapter.status()["local_available_slots"], 1)
+
+    def test_confirmed_exit_retains_uncertain_partial_and_frees_only_local_slot(self):
+        adapter = self.adapter()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)) as launch:
+            receipt = adapter.submit("synthetic task", "task-1")
+            job_id = receipt["job_id"]
+            adapter.ledger.store(job_id, {"status": "submission_uncertain", "job_id": job_id,
+                "error": "cli_failed", "local_exit_confirmed": True,
+                "output": "synthetic partial", "output_kind": "partial"})
+            self.assertEqual(adapter.status()["local_available_slots"], 1)
+            self.assertEqual(adapter.status()["local_finished_unresolved"], 1)
+            state = self.adapter().poll(job_id)
+            self.assertEqual(state["status"], "submission_uncertain")
+            self.assertEqual(state["output_kind"], "partial")
+            self.assertEqual(state["output"], "synthetic partial")
+            self.assertEqual(adapter.submit("synthetic task", "task-1")["job_id"], job_id)
+            self.assertEqual(launch.call_count, 1)
+
+    def test_unconfirmed_exit_retains_local_slot(self):
+        adapter = self.adapter()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)):
+            receipt = adapter.submit("synthetic task", "task-1")
+            adapter.ledger.store(receipt["job_id"], {"status": "submission_uncertain",
+                "job_id": receipt["job_id"], "error": "execution_unverified", "local_exit_confirmed": False})
+            self.assertEqual(adapter.status()["local_available_slots"], 0)
+            self.assertEqual(adapter.submit("another", "task-2")["reason"], "provider_busy")
+
+    def test_worker_persists_nonzero_partial_as_uncertain(self):
+        adapter = self.adapter()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)) as launch:
+            receipt = adapter.submit("synthetic task", "task-1")
+        def fake_execute(inner, job_id, task):
+            self.assertEqual(task, "synthetic task")
+            inner._update(job_id, status="submission_uncertain", error="cli_failed",
+                          output="synthetic partial", output_kind="partial", local_exit_confirmed=True)
+        with mock.patch.object(subject.GrokAdapter, "_execute", fake_execute):
+            self.assertEqual(subject.worker_main(str(self.root), receipt["job_id"]), 0)
+        state = self.adapter().poll(receipt["job_id"])
+        self.assertEqual(state["status"], "submission_uncertain")
+        self.assertEqual(state["output_kind"], "partial")
+        self.assertEqual(state["output"], "synthetic partial")
+        self.assertEqual(adapter.status()["local_available_slots"], 1)
+        self.assertEqual(adapter.submit("synthetic task", "task-1")["job_id"], receipt["job_id"])
+        self.assertEqual(launch.call_count, 1)
 
     def test_worker_survives_actual_launcher_exit_then_new_adapter_polls(self):
         # This starts only synthetic Python processes, never the Grok CLI.

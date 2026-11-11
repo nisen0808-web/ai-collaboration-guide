@@ -29,6 +29,7 @@ SUBMIT_REASONS = frozenset({
     "adapter_unavailable", "adapter_error", "login_required", "billing_unverified",
     "provider_busy", "invalid_task", "invalid_task_id", "cli_or_profile_unavailable",
     "task_id_conflict", "worker_unavailable", "already_submitted",
+    "state_unavailable", "state_write_failed", "dispatch_interrupted",
 })
 POLL_ERRORS = frozenset({
     "login_required", "provider_busy", "provider_error", "adapter_error", "timed_out",
@@ -38,6 +39,8 @@ POLL_ERRORS = frozenset({
     "provider_reported_error", "provider_slow", "provider_result_unavailable",
     "inspection_unavailable", "unexpected_or_unknown_extensions", "process_still_running",
     "cli_failed", "empty_result", "execution_unverified", "job_state_unavailable",
+    "worker_error", "worker_identity_unconfirmed", "worker_start_unconfirmed",
+    "worker_request_invalid", "dispatch_interrupted", "state_write_failed",
 })
 
 
@@ -116,7 +119,7 @@ class Coordinator:
                         method = value.get("authMethod")
                         if method in ("oauth", "claude.ai", "subscription", "cached_token", "api_key", "unknown"):
                             safe["authMethod"] = method
-                        for key in ("local_active", "local_limit", "local_active_jobs", "local_max_concurrency", "local_available_slots", "local_observed_inflight", "local_uncertain"):
+                        for key in ("local_active", "local_limit", "local_active_jobs", "local_max_concurrency", "local_available_slots", "local_observed_inflight", "local_uncertain", "local_finished_unresolved"):
                             count = value.get(key)
                             if type(count) is int and 0 <= count <= 1000:
                                 safe[key] = count
@@ -301,6 +304,11 @@ class Coordinator:
         if "output" in response:
             result["output"] = response["output"]
             result["output_kind"] = "final" if actual == "succeeded" else "partial"
+        if type(response.get("local_exit_confirmed")) is bool:
+            # Local exit is not proof of the remote result or non-submission.
+            result["local_exit_confirmed"] = response["local_exit_confirmed"]
+        if type(response.get("inspection_metadata_unverified")) is bool:
+            result["inspection_metadata_unverified"] = response["inspection_metadata_unverified"]
         error = response.get("error")
         # Only accept known fixed codes, never arbitrary provider diagnostics.
         if isinstance(error, str) and error in POLL_ERRORS:

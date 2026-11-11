@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -15,6 +16,8 @@ from coordinator import Coordinator  # noqa: E402
 from mcp_stdio import serve  # noqa: E402
 from claude.durable_claude import DurableClaudeAdapter as ClaudeAdapter  # noqa: E402
 from grok.durable_grok import DurableGrokAdapter as GrokAdapter  # noqa: E402
+from claude.claude_adapter import ClaudeAdapter as ClaudeLoginAdapter  # noqa: E402
+from grok.grok_adapter import GrokAdapter as GrokLoginAdapter  # noqa: E402
 
 
 def executable(name: str) -> str | None:
@@ -24,6 +27,20 @@ def executable(name: str) -> str | None:
         return str(Path(found).resolve())
     path = Path(name).expanduser()
     return str(path.resolve()) if path.is_file() else None
+
+
+def installation_executable(name: str) -> tuple[str, bool]:
+    """Pin a found client or explicit path; keep an absent bare CLI name."""
+    found = executable(name)
+    if found:
+        return str(Path(found).expanduser().resolve()), True
+    path = Path(name).expanduser()
+    # An explicitly supplied path must retain its original meaning when the
+    # server is started later in another directory, even if not installed yet.
+    if path.is_absolute() or len(path.parts) > 1 or name.startswith((".", "~")):
+        return str(path.resolve()), False
+    # A missing bare executable may become available on PATH later.
+    return name, False
 
 
 def build_adapters(args: argparse.Namespace) -> dict:
@@ -64,6 +81,33 @@ def build_adapters(args: argparse.Namespace) -> dict:
     return adapters
 
 
+def build_login_adapter(args: argparse.Namespace):
+    """Prepare only the chosen official login without opening job databases.
+
+    None means the executable could not be found. Local setup errors are
+    raised separately and converted to a fixed, path-free message by main.
+    """
+    name = args.claude_cli if args.provider == "claude" else args.grok_cli
+    cli = executable(name)
+    if cli is None:
+        return None
+    data = Path(args.data_dir).expanduser().resolve()
+    data.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if args.provider == "claude":
+        profile = (Path(args.claude_profile).expanduser().resolve()
+                   if args.claude_profile else data / "claude-profile")
+        work = data / "claude-work"
+        profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+        work.mkdir(exist_ok=True, mode=0o700)
+        return ClaudeLoginAdapter(cli, str(profile), str(work), args.claude_model,
+                                  args.claude_effort, enabled=True, timeout_seconds=args.timeout)
+    profile = (Path(args.grok_profile).expanduser().resolve()
+               if args.grok_profile else data / "grok-profile")
+    profile.mkdir(parents=True, exist_ok=True, mode=0o700)
+    return GrokLoginAdapter(cli, args.grok_model, args.grok_effort, str(profile),
+                            timeout_seconds=args.timeout)
+
+
 def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--data-dir", default=str(Path.home() / ".local-ai-team"),
@@ -97,35 +141,70 @@ def main(argv: list[str] | None = None) -> int:
             if codex_cli is None:
                 print("Codex was not found. Install it or specify its path.", file=sys.stderr)
                 return 1
-            # A unique name avoids overwriting any existing MCP server.
-            name = "ai_team_" + uuid.uuid4().hex[:16]
-            command = [codex_cli, "mcp", "add", name, "--", sys.executable,
-                       str(Path(__file__).resolve()), "serve", "--data-dir", args.data_dir,
-                       "--claude-cli", args.claude_cli, "--grok-cli", args.grok_cli,
+            # Reserve the installation attempt before invoking Codex. An
+            # interrupted command may already have changed Codex, so a
+            # subsequent invocation must not silently add another server.
+            # This tool-owned marker is not proof the server still exists.
+            data = Path(args.data_dir).expanduser().resolve()
+            claude_cli, claude_found = installation_executable(args.claude_cli)
+            grok_cli, grok_found = installation_executable(args.grok_cli)
+            claude_profile = str(Path(args.claude_profile).expanduser().resolve()) if args.claude_profile else None
+            grok_profile = str(Path(args.grok_profile).expanduser().resolve()) if args.grok_profile else None
+            data.mkdir(parents=True, exist_ok=True, mode=0o700)
+            marker = data / "codex-install-attempt.txt"
+            name = "ai_team_" + uuid.uuid4().hex
+            try:
+                fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                print("A previous installation attempt exists. No server was added; "
+                      "check Codex before removing codex-install-attempt.txt "
+                      "from this tool's data directory and trying again.", file=sys.stderr)
+                return 1
+            with os.fdopen(fd, "w", encoding="utf-8") as stream:
+                stream.write(name + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            command = [codex_cli, "mcp", "add", name, "--", str(Path(sys.executable).resolve()),
+                       str(Path(__file__).resolve()), "serve", "--data-dir", str(data),
+                       "--claude-cli", claude_cli, "--grok-cli", grok_cli,
                        "--claude-model", args.claude_model, "--grok-model", args.grok_model,
                        "--claude-effort", args.claude_effort, "--grok-effort", args.grok_effort,
                        "--timeout", str(args.timeout)]
-            for flag, value in (("--claude-profile", args.claude_profile), ("--grok-profile", args.grok_profile)):
+            for flag, value in (("--claude-profile", claude_profile), ("--grok-profile", grok_profile)):
                 if value:
                     command.extend((flag, value))
             completed = subprocess.run(command, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                        check=False, shell=False)
             if completed.returncode:
-                print("Could not add the MCP server; check the Codex installation.", file=sys.stderr)
+                print("Could not confirm the MCP server was added. Check Codex before "
+                      "removing the local installation marker or retrying.", file=sys.stderr)
                 return 1
             print(f"Added MCP server {name}. Restart the Codex connection to load it.")
+            for label, found in (("Claude", claude_found), ("Grok", grok_found)):
+                if not found:
+                    print(f"{label} client was not found during installation; "
+                          "its availability must be checked when the server starts.", file=sys.stderr)
             return 0
-        adapters = build_adapters(args)
         if args.mode == "login":
-            provider = adapters.get(args.provider)
+            try:
+                provider = build_login_adapter(args)
+            except Exception:
+                print("Unable to prepare official login. Check local configuration or permissions.", file=sys.stderr)
+                return 1
             if provider is None:
                 print("Official client not found. Install it or specify its path.", file=sys.stderr)
                 return 1
-            result = provider.login()
-            if isinstance(result, dict):
-                return 0 if result.get("status") == "finished" else 1
-            return int(result)
+            try:
+                result = provider.login()
+                ok = (result.get("status") == "finished" if isinstance(result, dict)
+                      else type(result) is int and result == 0)
+            except Exception:
+                ok = False
+            if not ok:
+                print("Official login did not complete. Check the client and local configuration.", file=sys.stderr)
+            return 0 if ok else 1
+        adapters = build_adapters(args)
         data = Path(args.data_dir).expanduser().resolve()
         core = Coordinator(data / "requests.sqlite3", adapters=adapters)
         for stream in (sys.stdin, sys.stdout):

@@ -16,8 +16,16 @@ import tempfile
 import threading
 import uuid
 
+if __package__:
+    from .inspect_policy import inspect_report_diagnostics
+else:
+    from inspect_policy import inspect_report_diagnostics
 
-_ENV_NAMES = ("PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR")
+
+_NETWORK_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+                      "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+                      "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR")
+_ENV_NAMES = ("PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR", *_NETWORK_ENV_NAMES)
 _INSPECT_KEYS = ("hooks", "plugins", "mcpServers", "skills", "lspServers", "projectInstructions")
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _EFFORTS = frozenset({"low", "medium", "high", "xhigh"})
@@ -50,9 +58,9 @@ class GrokAdapter:
         self._active_job_ids: set[str] = set()
 
     def _env(self, isolated_home: Path) -> dict[str, str]:
-        # Read only specifically named, non-credential variables.  In
-        # particular do not inspect or inherit API-key/config overrides.
-        env = {k: v for k in _ENV_NAMES if isinstance((v := os.environ.get(k)), str)}
+        # Proxy variables may contain credentials: pass them without logging.
+        # Never inspect or inherit API-key/config overrides.
+        env = {k: v for k in _ENV_NAMES if isinstance((v := os.environ.get(k)), str) and "\0" not in v}
         env.update({"HOME": str(isolated_home), "USERPROFILE": str(isolated_home),
                     "GROK_HOME": str(self.profile), "TEMP": str(isolated_home),
                     "TMP": str(isolated_home), "GROK_DISABLE_AUTOUPDATER": "1",
@@ -157,11 +165,18 @@ class GrokAdapter:
         work: Path | None = None
         launched = False
         safe_cleanup = True
+        preserve_output = False
         try:
             work = Path(tempfile.mkdtemp(prefix="grok-collab-"))
             home = work / "home"
             home.mkdir(mode=0o700)
             env = self._env(home)
+            prompt, output = work / "task.txt", work / "output.txt"
+            argv = [str(self.cli), "--model", self.model, "--reasoning-effort", self.effort,
+                    "--prompt-file", str(prompt), "--session-id", job_id, "--output-format", "plain",
+                    "--tools", "", "--disallowed-tools", "bash,read,write,edit,glob,grep,web_search,web_fetch,task,lsp",
+                    "--deny", "*", "--permission-mode", "dontAsk", "--disable-web-search",
+                    "--no-subagents", "--no-plan", "--max-turns", "2"]
             self._update(job_id, status="running", phase="inspection")
             inspect = subprocess.run([str(self.cli), "inspect", "--json"], cwd=str(work), env=env,
                                      stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -170,22 +185,17 @@ class GrokAdapter:
                 self._update(job_id, status="failed", error="inspection_unavailable", submitted=False)
                 return
             report = json.loads(inspect.stdout.decode("utf-8-sig"))
-            if (not isinstance(report, dict)
-                or any(not isinstance(report.get(k), list) for k in _INSPECT_KEYS)
-                or any(report[k] for k in _INSPECT_KEYS)):
+            diagnostics = inspect_report_diagnostics(
+                report, subagents_disabled=env.get("GROK_SUBAGENTS") == "0" and "--no-subagents" in argv)
+            if not diagnostics["allowed"]:
                 self._update(job_id, status="failed", error="unexpected_or_unknown_extensions", submitted=False)
                 return
-            prompt, output = work / "task.txt", work / "output.txt"
+            self._update(job_id, inspection_metadata_unverified=diagnostics["unverified_metadata"])
             # Windows ACLs inherit from temp directory: do not claim Unix mode
             # alone protects private data on Windows.
             descriptor = os.open(prompt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
                 stream.write(task)
-            argv = [str(self.cli), "--model", self.model, "--reasoning-effort", self.effort,
-                    "--prompt-file", str(prompt), "--session-id", job_id, "--output-format", "plain",
-                    "--tools", "", "--disallowed-tools", "bash,read,write,edit,glob,grep,web_search,web_fetch,task,lsp",
-                    "--deny", "*", "--permission-mode", "dontAsk", "--disable-web-search",
-                    "--no-subagents", "--no-plan", "--max-turns", "2"]
             output_descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(output_descriptor, "wb") as result_file:
                 self._update(job_id, phase="submitting")
@@ -199,7 +209,7 @@ class GrokAdapter:
                 self._update(job_id, phase="waiting")
                 try:
                     code = child.wait(timeout=self.timeout)
-                    safe_cleanup = True
+                    safe_cleanup = type(code) is int
                 except subprocess.TimeoutExpired:
                     # Report promptly so coordination can continue, but keep
                     # tracking the SAME child in this worker. We never launch
@@ -208,25 +218,49 @@ class GrokAdapter:
                                  phase="waiting_for_original_process",
                                  error="process_still_running")
                     code = child.wait()
-                    safe_cleanup = True
+                    safe_cleanup = type(code) is int
+            if not safe_cleanup:
+                # A malformed wait result does not prove the child exited.
+                # Preserve the files and slot; it may still be writing.
+                preserve_output = True
+                self._update(job_id, status="submission_uncertain", phase="waiting",
+                             error="process_still_running", local_exit_confirmed=False)
+                return
             if code != 0:
-                self._update(job_id, status="failed", phase="completed", error="cli_failed", exit_code=code)
+                # A non-zero local exit does not establish what the remote
+                # service received. Keep any body explicitly partial and
+                # retain the file even if persisting metadata fails.
+                preserve_output = True
+                with output.open("rb") as result_file:
+                    data = result_file.read(_MAX_RESULT_BYTES + 1)
+                details = {"status": "submission_uncertain", "phase": "completed",
+                           "error": "cli_failed", "exit_code": code,
+                           "local_exit_confirmed": True}
+                if data:
+                    details.update(output=data[:_MAX_RESULT_BYTES].decode("utf-8", errors="replace"),
+                                   truncated=len(data) > _MAX_RESULT_BYTES, output_kind="partial")
+                self._update(job_id, **details)
                 return
             with output.open("rb") as result_file:
                 data = result_file.read(_MAX_RESULT_BYTES + 1)
             if not data.strip():
-                self._update(job_id, status="failed", phase="completed", error="empty_result")
+                self._update(job_id, status="submission_uncertain", phase="completed",
+                             error="empty_result", local_exit_confirmed=True)
                 return
             truncated = len(data) > _MAX_RESULT_BYTES
             self._update(job_id, status="succeeded", phase="completed", error=None,
                          output=data[:_MAX_RESULT_BYTES].decode("utf-8", errors="replace"),
                          truncated=truncated, quality_verified=False, billing_verified=False)
         except Exception:
+            if launched:
+                # Retain any output after a failed read or metadata write.
+                preserve_output = True
             self._update(job_id, status="submission_uncertain" if launched else "failed",
-                         error="execution_unverified", submitted=None if launched else False)
+                         error="execution_unverified", submitted=None if launched else False,
+                         local_exit_confirmed=bool(launched and safe_cleanup))
         finally:
             if work is not None and safe_cleanup:
-                for name in ("task.txt", "output.txt"):
+                for name in (("task.txt",) if preserve_output else ("task.txt", "output.txt")):
                     try:
                         (work / name).unlink(missing_ok=True)
                     except OSError:

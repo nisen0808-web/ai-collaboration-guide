@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-from claude_adapter import ClaudeAdapter, child_environment
+from claude_adapter import ClaudeAdapter, child_environment, _NETWORK_ENV_NAMES
 
 
 class ClaudeAdapterTests(unittest.TestCase):
@@ -45,6 +45,20 @@ class ClaudeAdapterTests(unittest.TestCase):
         for name in set(source) - {"PATH"}:
             self.assertNotIn(name, result)
         self.assertNotIn("synthetic-secret", repr(result))
+
+    def test_proxy_and_ca_configuration_is_passed_without_api_credentials(self):
+        # All values in this synthetic mapping are test fixtures, not host data.
+        source = {key: "synthetic-value" for key in _NETWORK_ENV_NAMES}
+        source.update({"HTTPS_PROXY": "http://synthetic-user:synthetic-password@127.0.0.1:8080",
+                       "ANTHROPIC_API_KEY": "synthetic-api-key", "NODE_OPTIONS": "synthetic-option"})
+        result = child_environment(source, self.profile, self.work)
+        for key in _NETWORK_ENV_NAMES:
+            self.assertEqual(result[key], source[key])
+        self.assertNotIn("ANTHROPIC_API_KEY", result)
+        self.assertNotIn("NODE_OPTIONS", result)
+
+    def test_invalid_proxy_environment_value_is_not_inherited(self):
+        self.assertNotIn("HTTPS_PROXY", child_environment({"HTTPS_PROXY": "invalid\0value"}, self.profile, self.work))
 
     def test_disabled_does_not_start_a_process(self):
         adapter = ClaudeAdapter(*self.options)
@@ -91,6 +105,62 @@ class ClaudeAdapterTests(unittest.TestCase):
         process.communicate.assert_called_once_with(input="synthetic task", timeout=900)
         self.assertFalse(generate.kwargs["shell"])
         self.assertEqual(generate.args[0][generate.args[0].index("--tools") + 1], "")
+        self.assertIn("--no-session-persistence", generate.args[0])
+        self.assertNotIn("--bare", generate.args[0])
+
+    def test_nonzero_structured_error_is_failed_without_returning_body(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, max_concurrency=1)
+        process = Mock(returncode=1)
+        process.communicate.return_value = (json.dumps({"is_error": True, "result": "synthetic-sensitive"}), "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process) as started:
+            adapter.submit("task", "error1")
+            result = self.wait_job(adapter, "error1")
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["error"], "provider_reported_error")
+            self.assertTrue(result["local_exit_confirmed"])
+            self.assertNotIn("synthetic-sensitive", repr(result))
+            for _ in range(100):
+                if adapter.status()["local_active"] == 0:
+                    break
+                time.sleep(0.005)
+            self.assertEqual(adapter.status()["local_active"], 0)
+            self.assertEqual(started.call_count, 1)
+
+    def test_missing_error_flag_is_uncertain_not_reported_failure(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True)
+        process = Mock(returncode=0)
+        process.communicate.return_value = (json.dumps({"result": "synthetic response"}), "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process):
+            adapter.submit("task", "missing-flag")
+            result = self.wait_job(adapter, "missing-flag")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertEqual(result["error"], "invalid_provider_response")
+        self.assertTrue(result["local_exit_confirmed"])
+
+    def test_nonzero_unstructured_error_remains_uncertain(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True)
+        process = Mock(returncode=1)
+        process.communicate.return_value = ("synthetic-sensitive", "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process):
+            adapter.submit("task", "error2")
+            result = self.wait_job(adapter, "error2")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertTrue(result["local_exit_confirmed"])
+        self.assertNotIn("synthetic-sensitive", repr(result))
+
+    def test_structured_error_without_confirmed_exit_stays_uncertain(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True)
+        process = Mock(returncode=None)
+        process.communicate.return_value = (json.dumps({"is_error": True}), "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process):
+            adapter.submit("task", "error3")
+            result = self.wait_job(adapter, "error3")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertFalse(result["local_exit_confirmed"])
 
     def test_login_failure_never_sends_model_request(self):
         adapter = ClaudeAdapter(*self.options, enabled=True)

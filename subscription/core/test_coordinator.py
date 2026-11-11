@@ -7,6 +7,7 @@ import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
+from unittest.mock import patch
 
 from coordinator import Coordinator, InputError, POLL_ERRORS, SUBMIT_REASONS
 
@@ -23,6 +24,51 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(c.submit("claude", "task", "key-c")["status"], "not_submitted")
         self.assertEqual(c.submit("grok", "task", "key-g")["status"], "queued")
         self.assertEqual(len(calls), 1)
+
+    def test_known_unstarted_write_failure_stays_not_submitted_without_retry(self):
+        calls = []
+        def unstarted(**kwargs):
+            calls.append(kwargs)
+            return {"status": "not_submitted", "reason": "state_write_failed"}
+        coordinator = Coordinator(self.db, {"grok": unstarted})
+        result = coordinator.submit("grok", "synthetic task", "request-key")
+        self.assertEqual(result["status"], "not_submitted")
+        self.assertEqual(result["reason"], "state_write_failed")
+        self.assertIsNone(result["job_id"])
+        replay = coordinator.submit("grok", "synthetic task", "request-key")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["status"], "not_submitted")
+        self.assertEqual(len(calls), 1)
+
+    def test_actual_grok_write_failure_is_reported_not_submitted(self):
+        # Exercise the real local adapter and coordinator with a synthetic CLI
+        # and a failing state write; no provider process or network is used.
+        root = Path(self.tmp.name)
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from grok import durable_grok
+            state = root / "grok-state"
+            profile = root / "grok-profile"
+            cli = root / "synthetic-grok"
+            state.mkdir()
+            profile.mkdir()
+            cli.touch()
+            adapter = durable_grok.DurableGrokAdapter(str(cli), "synthetic-model", "medium",
+                                                       str(profile), str(state))
+            coordinator = Coordinator(self.db, {"grok": adapter})
+            with patch.object(adapter.ledger, "write_request", side_effect=OSError("synthetic")), \
+                 patch.object(durable_grok.subprocess, "Popen", side_effect=AssertionError("must not start")) as launch:
+                result = coordinator.submit("grok", "synthetic task", "request-key")
+                replay = coordinator.submit("grok", "synthetic task", "request-key")
+                launch.assert_not_called()
+            self.assertEqual(result["status"], "not_submitted")
+            self.assertEqual(result["reason"], "state_write_failed")
+            self.assertIsNone(result["job_id"])
+            self.assertTrue(replay["replayed"])
+            self.assertEqual(replay["status"], "not_submitted")
+        finally:
+            sys.path.remove(package_root)
 
     def test_replay_never_dispatches_again(self):
         calls = []
@@ -328,6 +374,20 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         response = c.submit("grok", "task", "unsafe-reason")
         self.assertIsNone(response["reason"])
         self.assertNotIn(adapter.reason, str(response))
+
+    def test_confirmed_local_exit_is_distinct_from_unknown_remote_result(self):
+        class Adapter:
+            def submit(self, **kw): return {"status": "queued", "job_id": "job-1"}
+            def poll(self, job_id):
+                return {"status": "submission_uncertain", "error": "worker_identity_unconfirmed",
+                        "local_exit_confirmed": True, "inspection_metadata_unverified": True}
+        coordinator = Coordinator(self.db, {"claude": Adapter()})
+        coordinator.submit("claude", "synthetic", "key")
+        result = coordinator.result("claude", "key")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertEqual(result["error"], "worker_identity_unconfirmed")
+        self.assertIs(result["local_exit_confirmed"], True)
+        self.assertIs(result["inspection_metadata_unverified"], True)
 
     def test_known_poll_errors_preserved_and_slow_job_reconciles(self):
         class Adapter:

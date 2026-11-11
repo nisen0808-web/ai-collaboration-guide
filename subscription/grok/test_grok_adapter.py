@@ -88,6 +88,22 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(self.instance.submit("different", "task-1")["reason"], "task_id_conflict")
             self.assertEqual(len(seen), 2)
 
+    def test_proxy_and_ca_are_forwarded_without_inheriting_api_keys(self):
+        source = {key: "synthetic-value" for key in subject._NETWORK_ENV_NAMES}
+        source.update({"https_proxy": "http://synthetic-user:synthetic-password@127.0.0.1:8080",
+                       "XAI_API_KEY": "synthetic-api-key", "NODE_OPTIONS": "synthetic-option"})
+        with mock.patch.object(subject.os, "environ", source):
+            result = self.instance._env(self.profile)
+        for key in subject._NETWORK_ENV_NAMES:
+            self.assertEqual(result[key], source[key])
+        self.assertNotIn("XAI_API_KEY", result)
+        self.assertNotIn("NODE_OPTIONS", result)
+
+    def test_invalid_proxy_environment_value_is_not_inherited(self):
+        with mock.patch.object(subject.os, "environ", {"HTTPS_PROXY": "invalid\0value"}):
+            result = self.instance._env(self.profile)
+        self.assertNotIn("HTTPS_PROXY", result)
+
     def test_unrecognized_or_nonempty_inspection_never_generates(self):
         for report in ({}, dict(self.report, plugins=["synthetic"])):
             with self.subTest(report=report), \
@@ -99,6 +115,29 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(state["status"], "failed")
                 self.assertFalse(state["submitted"])
                 self.available(2)
+
+    def test_explicitly_disabled_synthetic_skill_does_not_block(self):
+        report = dict(self.report, skills=[{"name": "synthetic", "enabled": False}])
+        with mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(report).encode())), \
+             mock.patch.object(subject.subprocess, "Popen", side_effect=FakeChild) as launched:
+            task = self.instance.submit("synthetic", "disabled-skill")
+            self.assertEqual(self.completed(task["job_id"])["output"], "synthetic answer")
+            self.assertEqual(launched.call_count, 1)
+
+    def test_builtin_agents_pass_only_with_disabled_subagents_flags(self):
+        report = dict(self.report, agents=[{"source": {"type": "builtin"}}])
+        seen = []
+        def fake_child(argv, **kwargs):
+            seen.append((argv, kwargs["env"]))
+            return FakeChild(argv, **kwargs)
+        with mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(report).encode())), \
+             mock.patch.object(subject.subprocess, "Popen", side_effect=fake_child):
+            task = self.instance.submit("synthetic", "builtin-agent")
+            state = self.completed(task["job_id"])
+        self.assertEqual(state["output"], "synthetic answer")
+        self.assertIs(state["inspection_metadata_unverified"], True)
+        self.assertIn("--no-subagents", seen[0][0])
+        self.assertEqual(seen[0][1]["GROK_SUBAGENTS"], "0")
 
     def test_timeout_is_uncertain_then_original_result_is_recovered(self):
         waiting_for_original = threading.Event()
@@ -220,6 +259,44 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(state["status"], "submission_uncertain")
             self.assertEqual(self.instance.status()["local_available_slots"], 0)
             self.assertEqual(self.instance.submit("another", "another-key")["reason"], "provider_busy")
+            self.assertEqual(started.call_count, 1)
+
+    def test_nonzero_exit_preserves_partial_and_releases_local_slot_without_resubmit(self):
+        paths = []
+        class Nonzero(FakeChild):
+            def __init__(self, argv, **kwargs):
+                super().__init__(argv, **kwargs)
+                paths.append(Path(argv[argv.index("--prompt-file") + 1]).parent / "output.txt")
+            def wait(self, timeout=None):
+                return 17
+        with mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(self.report).encode())), \
+             mock.patch.object(subject.subprocess, "Popen", side_effect=Nonzero) as started:
+            receipt = self.instance.submit("synthetic", "nonzero")
+            state = self.completed(receipt["job_id"])
+            self.assertEqual(state["status"], "submission_uncertain")
+            self.assertEqual(state["error"], "cli_failed")
+            self.assertEqual(state["output"], "synthetic answer")
+            self.assertEqual(state["output_kind"], "partial")
+            self.assertTrue(state["local_exit_confirmed"])
+            self.available(2)
+            self.assertEqual(paths[0].read_bytes(), b"synthetic answer")
+            self.assertTrue(self.instance.submit("synthetic", "nonzero")["replayed"])
+            self.assertEqual(started.call_count, 1)
+
+    def test_noninteger_wait_result_preserves_slot_and_output(self):
+        class Unknown(FakeChild):
+            def wait(self, timeout=None):
+                return None
+        self.instance = subject.GrokAdapter(str(self.cli), "example-model", "high", str(self.profile),
+                                            timeout_seconds=2, max_concurrency=1)
+        with mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(self.report).encode())), \
+             mock.patch.object(subject.subprocess, "Popen", side_effect=Unknown) as started:
+            receipt = self.instance.submit("synthetic", "unknown-wait")
+            state = self.completed(receipt["job_id"])
+            self.assertEqual(state["status"], "submission_uncertain")
+            self.assertFalse(state["local_exit_confirmed"])
+            self.assertEqual(self.instance.status()["local_available_slots"], 0)
+            self.assertEqual(self.instance.submit("other", "other")["reason"], "provider_busy")
             self.assertEqual(started.call_count, 1)
 
 
