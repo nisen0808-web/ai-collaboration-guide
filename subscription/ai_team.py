@@ -219,7 +219,7 @@ def reconcile(args: argparse.Namespace) -> int:
                 valid_id = (isinstance(job_id, str) and
                             (bool(claude_ledger._TASK_ID.fullmatch(job_id)) if args.provider == "claude"
                              else grok_ledger._valid_id(job_id)))
-                state_value = state_value if state_value in ("reserved", "dispatching", "queued", "running", "submission_uncertain", "not_submitted") else "unknown"
+                state_value = state_value if state_value in ("reserved", "dispatching", "queued", "running", "submission_uncertain", "finished_uncertain", "not_submitted") else "unknown"
                 worker = job.get("worker_state", "unknown")
                 if worker not in ("running", "exited", "unknown"):
                     worker = "unknown"

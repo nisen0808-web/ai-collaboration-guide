@@ -20,6 +20,11 @@ else:
 
 _TASK_ID = re.compile(r"^[A-Za-z0-9_-]{1,100}$")
 _ACTIVE = ("reserved", "queued", "running", "submission_uncertain")
+_EXIT_UNCONFIRMED = ("process_exit_unconfirmed", "process_still_running",
+                     "worker_identity_unconfirmed", "operator_released")
+_BLOCKING_WHERE = ("(status IN (?,?,?,?) OR "
+                   "(status='finished_uncertain' AND error IN (?,?,?,?)))")
+_BLOCKING_PARAMS = _ACTIVE + _EXIT_UNCONFIRMED
 
 
 class ReadOnlyClaudeLedger:
@@ -54,8 +59,9 @@ class ReadOnlyClaudeLedger:
                   "verification": "not_verified"}
         try:
             with self._connection() as con:
-                rows = con.execute("SELECT status,heartbeat FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchall()
-                finished = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('finished_uncertain','operator_released')").fetchone()[0]
+                rows = con.execute("SELECT status,heartbeat FROM jobs WHERE " + _BLOCKING_WHERE, _BLOCKING_PARAMS).fetchall()
+                finished = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('finished_uncertain','operator_released') "
+                                       "AND NOT (status='finished_uncertain' AND COALESCE(error,'') IN (?,?,?,?))", _EXIT_UNCONFIRMED).fetchone()[0]
             now = time.time()
             observed = sum(row[0] in ("queued", "running") and row[1] is not None
                            and 0 <= now - row[1] <= 10 for row in rows)
@@ -106,7 +112,7 @@ class ReadOnlyClaudeLedger:
             return attach({"status": "submission_uncertain", "error": "operator_released",
                            "local_exit_confirmed": False, "release_basis": "operator_confirmed"})
         if status == "finished_uncertain":
-            return attach({"status": "submission_uncertain", "error": error, "local_exit_confirmed": True})
+            return attach({"status": "submission_uncertain", "error": error, "local_exit_confirmed": error not in _EXIT_UNCONFIRMED})
         if status == "succeeded":
             expected = job_id + ".result.json"
             if output_file != expected:

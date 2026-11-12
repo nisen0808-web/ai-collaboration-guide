@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 import claude_adapter
 import durable_claude
+from readonly_ledger import ReadOnlyClaudeLedger
 
 
 class ConfirmedExitTests(unittest.TestCase):
@@ -79,6 +80,33 @@ class ConfirmedExitTests(unittest.TestCase):
             {"status": "submission_uncertain", "error": "provider_result_unavailable", "local_exit_confirmed": False})
         self.assertEqual(result["status"], "submission_uncertain")
         self.assertEqual(adapter.status()["local_active"], 1)
+
+    def test_contradictory_exit_evidence_retains_slot_and_is_not_reported_as_confirmed(self):
+        for error in durable_claude._EXIT_UNCONFIRMED:
+            with self.subTest(error=error):
+                # Exercise the actual worker transition, not a normal success path.
+                adapter, result = self._run_receipt({"status": "queued"},
+                    {"status": "submission_uncertain", "error": error, "local_exit_confirmed": True})
+                self.assertEqual(result["status"], "submission_uncertain")
+                self.assertEqual(adapter.status()["local_active"], 1)
+                self.assertNotEqual(result.get("local_exit_confirmed"), True)
+                with durable_claude._connect(adapter.db) as con:
+                    con.execute("DELETE FROM worker_claims")
+                    con.execute("DELETE FROM jobs")
+
+    def test_legacy_conflicting_finished_record_stays_blocking_and_unconfirmed(self):
+        adapter = durable_claude.DurableClaudeAdapter(*self.args, enabled=True, max_concurrency=1)
+        with durable_claude._connect(adapter.db) as con:
+            con.execute("INSERT INTO jobs VALUES (?,?,?,?,?,?)",
+                        ("legacy", "digest", "finished_uncertain", "process_exit_unconfirmed", None, None))
+        readonly = ReadOnlyClaudeLedger(str(self.state))
+        for ledger in (adapter, readonly):
+            self.assertEqual(ledger.status()["local_active"], 1)
+            self.assertEqual(ledger.status()["local_finished_unresolved"], 0)
+            self.assertFalse(ledger.poll("legacy")["local_exit_confirmed"])
+        self.assertEqual(adapter.submit("other", "new")["reason"], "provider_busy")
+        self.assertEqual(durable_claude.operator_release(str(self.state), "legacy"), "identity_unconfirmed")
+        self.assertEqual([job["job_id"] for job in durable_claude.blocking_jobs(str(self.state))], ["legacy"])
 
     def test_write_failure_with_confirmed_exit_frees_slot_without_result_or_relaunch(self):
         adapter, result = self._run_receipt({"status": "queued"},

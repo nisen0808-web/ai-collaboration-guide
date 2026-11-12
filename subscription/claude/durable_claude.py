@@ -31,6 +31,15 @@ _TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
 _WORKER_SCRIPT = str(Path(__file__).resolve())
 _MAX_INPUT_BYTES = 900_000
 _ACTIVE = ("reserved", "queued", "running", "submission_uncertain")
+_EXIT_UNCONFIRMED = ("process_exit_unconfirmed", "process_still_running",
+                     "worker_identity_unconfirmed", "operator_released")
+_BLOCKING_WHERE = ("(status IN (?,?,?,?) OR "
+                   "(status='finished_uncertain' AND error IN (?,?,?,?)))")
+_BLOCKING_PARAMS = _ACTIVE + _EXIT_UNCONFIRMED
+
+
+def _confirmed_exit(result):
+    return result.get("local_exit_confirmed") is True and result.get("error") not in _EXIT_UNCONFIRMED
 
 
 def _process_identity(pid: int) -> str | None:
@@ -169,10 +178,10 @@ def blocking_jobs(state_dir) -> list[dict] | None:
         if has_claims:
             rows = con.execute("SELECT jobs.id,jobs.status,jobs.heartbeat,worker_claims.pid,worker_claims.identity "
                                "FROM jobs LEFT JOIN worker_claims ON worker_claims.job_id=jobs.id "
-                               "WHERE jobs.status IN (?,?,?,?) ORDER BY jobs.id", _ACTIVE).fetchall()
+                               "WHERE " + _BLOCKING_WHERE.replace("status", "jobs.status").replace("error", "jobs.error") + " ORDER BY jobs.id", _BLOCKING_PARAMS).fetchall()
         else:
             rows = con.execute("SELECT id,status,heartbeat,NULL AS pid,NULL AS identity FROM jobs "
-                               "WHERE status IN (?,?,?,?) ORDER BY id", _ACTIVE).fetchall()
+                               "WHERE " + _BLOCKING_WHERE + " ORDER BY id", _BLOCKING_PARAMS).fetchall()
     finally:
         con.close()
     now = time.time()
@@ -199,10 +208,10 @@ def operator_release(state_dir, job_id: str) -> str:
     con.row_factory = sqlite3.Row
     try:
         con.execute("BEGIN IMMEDIATE")
-        row = con.execute("SELECT status,heartbeat FROM jobs WHERE id=?", (job_id,)).fetchone()
+        row = con.execute("SELECT status,error,heartbeat FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             return "unknown_job"
-        if row["status"] not in _ACTIVE:
+        if row["status"] not in _ACTIVE and not (row["status"] == "finished_uncertain" and row["error"] in _EXIT_UNCONFIRMED):
             return "not_blocking"
         try:
             worker = con.execute("SELECT pid,identity FROM worker_claims WHERE job_id=?", (job_id,)).fetchone()
@@ -260,9 +269,10 @@ class DurableClaudeAdapter:
 
     def status(self) -> dict:
         with _connect(self.db) as con:
-            rows = con.execute("SELECT status,heartbeat FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchall()
+            rows = con.execute("SELECT status,heartbeat FROM jobs WHERE " + _BLOCKING_WHERE, _BLOCKING_PARAMS).fetchall()
             finished_unresolved = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN "
-                                              "('finished_uncertain','operator_released')").fetchone()[0]
+                                              "('finished_uncertain','operator_released') AND NOT (status='finished_uncertain' "
+                                              "AND COALESCE(error,'') IN (?,?,?,?))", _EXIT_UNCONFIRMED).fetchone()[0]
         # A recent heartbeat is a local observation, not proof that a worker
         # or its provider child is alive. Uncertain rows continue to own slots.
         now = time.time()
@@ -319,7 +329,7 @@ class DurableClaudeAdapter:
                            ("worker_setup_failed", "input_too_large") else prior)
                 return {"status": "not_submitted", "reason": "already_submitted",
                         "job_id": task_id, "replayed": True, "existing_status": outcome}
-            active = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchone()[0]
+            active = con.execute("SELECT COUNT(*) FROM jobs WHERE " + _BLOCKING_WHERE, _BLOCKING_PARAMS).fetchone()[0]
             if active >= self.max_concurrency:
                 return {"status": "not_submitted", "reason": "provider_busy"}
             if self.session_evidence:
@@ -421,7 +431,7 @@ class DurableClaudeAdapter:
             # Local CLI exit is confirmed, but the remote outcome is not.
             # It does not occupy a live local slot and cannot be re-sent.
             result = {"status": "submission_uncertain", "error": error,
-                      "local_exit_confirmed": True}
+                      "local_exit_confirmed": error not in _EXIT_UNCONFIRMED}
             if session_quality is not None:
                 result["quality_verification"] = {**_stored_model_quality(None), **session_quality}
             return result
@@ -566,7 +576,7 @@ def _run_worker(state_dir: str, job_id: str) -> None:
                     # expose it as a usable result or launch the job again.
                     # Free only the local slot when this precise response
                     # carries explicit evidence of the CLI process exit.
-                    durable_status = ("finished_uncertain" if result.get("local_exit_confirmed") is True
+                    durable_status = ("finished_uncertain" if _confirmed_exit(result)
                                       else "submission_uncertain")
                     update(durable_status, "result_unavailable")
                     return
@@ -603,7 +613,7 @@ def _run_worker(state_dir: str, job_id: str) -> None:
             if status == "submission_uncertain" and result.get("error") != "provider_slow":
                 # Only an explicit, verified local exit can free this local
                 # slot. The remote result remains unknown and is never retried.
-                durable_status = ("finished_uncertain" if result.get("local_exit_confirmed") is True
+                durable_status = ("finished_uncertain" if _confirmed_exit(result)
                                   else "submission_uncertain")
                 update(durable_status, result.get("error"))
                 return

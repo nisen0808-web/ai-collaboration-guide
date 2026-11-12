@@ -408,7 +408,10 @@ class Coordinator:
             result["output_kind"] = "final" if actual == "succeeded" else "partial"
         if type(response.get("local_exit_confirmed")) is bool:
             # Local exit is not proof of the remote result or non-submission.
-            result["local_exit_confirmed"] = response["local_exit_confirmed"]
+            result["local_exit_confirmed"] = (response["local_exit_confirmed"] and
+                response.get("error") not in {"operator_released", "process_exit_unconfirmed",
+                                              "process_still_running", "worker_identity_unconfirmed"} and
+                response.get("release_basis") != "operator_confirmed")
         if response.get("error") == "operator_released" and response.get("release_basis") == "operator_confirmed":
             # A user assertion must not be represented as observed process exit.
             result["release_basis"] = "operator_confirmed"

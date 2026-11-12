@@ -128,6 +128,13 @@ class ReconcileTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertNotIn("private", out + err)
 
+    def test_conflicting_finished_state_is_visible_when_blocking(self):
+        rows = [{"job_id": "legacy", "state": "finished_uncertain", "worker_state": "unknown"}]
+        with patch.object(ai_team.claude_ledger, "blocking_jobs", return_value=rows):
+            code, out, _ = self.run_main("reconcile", "claude")
+        self.assertEqual(code, 0)
+        self.assertIn("legacy  finished_uncertain  worker=unknown", out)
+
     def test_release_does_not_claim_unknown_job_when_ledger_not_accessible(self):
         with tempfile.TemporaryDirectory() as tmp:
             for provider in ("claude", "grok"):
