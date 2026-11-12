@@ -205,15 +205,24 @@ def reconcile(args: argparse.Namespace) -> int:
     if args.release is None:
         jobs = ledger.blocking_jobs(str(state))
         if jobs is None:
-            print("No local job ledger exists for this provider.")
+            print("No accessible safe job ledger; existing jobs were not checked.")
+            return 1
         elif not jobs:
             print("No job holds a local slot.")
         else:
             for job in jobs:
+                if not isinstance(job, dict):
+                    print("invalid_record  state=unknown  worker=unknown")
+                    continue
+                job_id, state_value = job.get("job_id"), job.get("state")
+                valid_id = (isinstance(job_id, str) and
+                            (bool(claude_ledger._TASK_ID.fullmatch(job_id)) if args.provider == "claude"
+                             else grok_ledger._valid_id(job_id)))
+                state_value = state_value if state_value in ("reserved", "dispatching", "queued", "running", "submission_uncertain", "not_submitted") else "unknown"
                 worker = job.get("worker_state", "unknown")
                 if worker not in ("running", "exited", "unknown"):
                     worker = "unknown"
-                print(f"{job['job_id']}  {job['state']}  worker={worker}")
+                print(f"{job_id if valid_id else 'invalid_record'}  {state_value}  worker={worker}")
             print("Check the specific job and provider client process before any release.", file=sys.stderr)
         return 0
     if not args.confirm_process_exited:
