@@ -20,6 +20,13 @@ import ai_team
 
 
 class EntryPointTests(unittest.TestCase):
+    def test_default_state_directory_matches_user_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home_var = "USERPROFILE" if os.name == "nt" else "HOME"
+            with patch.dict(os.environ, {home_var: tmp}):
+                args = ai_team.parser().parse_args(["serve"])
+                self.assertEqual(Path(args.data_dir).expanduser(), Path.home() / ".local-ai-team")
+
     def test_setup_check_is_read_only_and_does_not_report_private_paths(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp, "codex-home")
