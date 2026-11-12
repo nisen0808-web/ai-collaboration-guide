@@ -50,7 +50,7 @@ python /absolute/path/to/ai_team.py serve
 python ai_team.py install --grok-model 可用模型名
 ```
 
-本工具启动 Claude 客户端时会设置官方的安全模式环境变量，请求不加载所选配置中的 CLAUDE.md、技能、插件、钩子、MCP 服务和自动记忆；官方文档表示认证仍可正常使用。这是对客户端的请求，不是对其实际加载内容的证明：旧版客户端可能忽略该变量，组织托管策略仍然生效，此项尚未用真实客户端验证。[环境变量说明](https://code.claude.com/docs/en/env-vars)
+本工具启动 Claude 客户端时会设置官方的安全模式环境变量，请求不加载所选配置中的 CLAUDE.md、技能、插件、钩子、MCP 服务和自动记忆；官方文档表示认证仍可正常使用。Windows 专用测试配置曾在设置这些变量后完成一次真实简短任务，见[验证记录](EVIDENCE.md)。这不是对实际加载内容的证明：旧版客户端可能忽略该变量，组织托管策略仍然生效。[环境变量说明](https://code.claude.com/docs/en/env-vars)
 
 Claude Code 需支持 `--permission-prompts`（官方说明为 2.1.259 或更新版本）；使用前请先检查版本。官方还提示未来可能调整 `-p` 的默认启动模式，届时需重新验证已登录账号的兼容性。本机已核对 Grok 1.0.52 的实际帮助中包含本工具使用的命令参数，不代表其他版本已验证。[Claude CLI 参考](https://code.claude.com/docs/en/cli-reference) · [Claude 程序化运行](https://code.claude.com/docs/en/headless) · [Grok CLI 参考](https://docs.x.ai/build/cli/reference)
 
