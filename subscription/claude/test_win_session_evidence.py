@@ -31,21 +31,34 @@ class WindowsSessionEvidenceTests(unittest.TestCase):
         identity = subprocess.run(["whoami.exe", "/user", "/fo", "csv", "/nh"],
                                   capture_output=True, text=True, shell=False)
         if identity.returncode:
-            self.skipTest("cannot determine test account")
+            self.fail("cannot determine synthetic test account")
         rows = list(csv.reader(io.StringIO(identity.stdout)))
         if not rows or len(rows[0]) != 2 or not rows[0][1].startswith("S-1-"):
-            self.skipTest("cannot determine test account")
+            self.fail("cannot determine synthetic test account")
+        self._owner_sid = rows[0][1]
         for path in (self.profile, self.work):
+            self._set_fixture_owner(path)
             result = subprocess.run(["icacls.exe", str(path), "/inheritance:r", "/grant:r",
-                                     "*" + rows[0][1] + ":(OI)(CI)F"],
+                                     "*" + self._owner_sid + ":(OI)(CI)F"],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
             if result.returncode:
-                self.skipTest("cannot make synthetic directory private")
+                self.fail("cannot make synthetic directory private")
         self.project = self.profile / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(self.work.resolve()))
         self.project.mkdir(parents=True)
+        self._set_fixture_owner(self.profile / "projects")
+        self._set_fixture_owner(self.project)
         self.session = str(uuid.uuid4())
         self.target = self.project / (self.session + ".jsonl")
         self.other = self.project / (str(uuid.uuid4()) + ".jsonl")
+
+    def _set_fixture_owner(self, path):
+        """Set ownership only on this test's synthetic files or directories."""
+        if not path.is_relative_to(Path(self.temp.name).resolve()):
+            self.fail("synthetic ownership target outside test directory")
+        result = subprocess.run(["icacls.exe", str(path), "/setowner", "*" + self._owner_sid],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
+        if result.returncode:
+            self.fail("cannot set synthetic fixture owner")
 
     def _fixture_diagnostics(self):
         """Only fixed booleans/categories; never emit paths, ACLs or SIDs."""
@@ -113,6 +126,8 @@ class WindowsSessionEvidenceTests(unittest.TestCase):
             "message": {"model": "claude-synthetic", "content": "synthetic-secret"},
             "effort": "medium"}) + "\n", encoding="utf-8")
         self.other.write_text("unrelated synthetic session", encoding="utf-8")
+        self._set_fixture_owner(self.target)
+        self._set_fixture_owner(self.other)
         self.assertFalse(evidence.prepare_session_evidence(str(self.profile), str(self.work), self.session, enabled=True))
         out = evidence.collect_session_evidence(str(self.profile), str(self.work), self.session,
             "claude-synthetic", "medium", process_exit_confirmed=True, enabled=True)
@@ -148,6 +163,7 @@ class WindowsSessionEvidenceTests(unittest.TestCase):
     def test_damaged_or_cross_session_record_is_retained(self):
         self.target.write_text(json.dumps({"type": "assistant", "sessionId": str(uuid.uuid4()),
             "message": {"model": "claude-synthetic"}, "effort": "medium"}), encoding="utf-8")
+        self._set_fixture_owner(self.target)
         out = evidence.collect_session_evidence(str(self.profile), str(self.work), self.session,
             "claude-synthetic", "medium", process_exit_confirmed=True, enabled=True)
         self.assertEqual(out["client_evidence_status"], "unavailable")
@@ -156,6 +172,7 @@ class WindowsSessionEvidenceTests(unittest.TestCase):
 
     def test_broad_profile_acl_rejects_without_reading_or_deleting(self):
         self.target.write_text("synthetic", encoding="utf-8")
+        self._set_fixture_owner(self.target)
         changed = subprocess.run(["icacls.exe", str(self.profile), "/grant", "*S-1-1-0:(OI)(CI)F"],
                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
         if changed.returncode:
@@ -173,16 +190,12 @@ class WindowsSessionEvidenceTests(unittest.TestCase):
             self.skipTest("Windows C# compiler unavailable")
         state = Path(self.temp.name) / "state"
         state.mkdir()
-        identity = subprocess.run(["whoami.exe", "/user", "/fo", "csv", "/nh"], capture_output=True, text=True, shell=False)
-        if identity.returncode:
-            self.skipTest("cannot determine test account")
-        rows = list(csv.reader(io.StringIO(identity.stdout)))
-        if not rows or len(rows[0]) != 2 or not rows[0][1].startswith("S-1-"):
-            self.skipTest("cannot determine test account")
-        acl = subprocess.run(["icacls.exe", str(state), "/inheritance:r", "/grant:r", "*" + rows[0][1] + ":(OI)(CI)F"],
+        state = state.resolve()
+        self._set_fixture_owner(state)
+        acl = subprocess.run(["icacls.exe", str(state), "/inheritance:r", "/grant:r", "*" + self._owner_sid + ":(OI)(CI)F"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
         if acl.returncode:
-            self.skipTest("cannot make synthetic state directory private")
+            self.fail("cannot make synthetic state directory private")
         # The executable handles only a fixed fake auth status and one fixed
         # synthetic prompt. It has no network or credential-reading code.
         source = Path(self.temp.name) / "synthetic_cli.cs"
@@ -190,6 +203,7 @@ class WindowsSessionEvidenceTests(unittest.TestCase):
         source.write_text(r'''
 using System;
 using System.IO;
+using System.Security.Principal;
 using System.Text;
 using System.Text.RegularExpressions;
 class SyntheticCli {
@@ -212,7 +226,14 @@ class SyntheticCli {
         string project = Path.Combine(profile, "projects", Regex.Replace(work, "[^a-zA-Z0-9]", "-"));
         string row = "{\"type\":\"assistant\",\"sessionId\":\"" + id +
             "\",\"message\":{\"model\":\"claude-synthetic\",\"content\":\"synthetic private\"},\"effort\":\"medium\"}";
-        File.WriteAllText(Path.Combine(project, id + ".jsonl"), row + "\n", new UTF8Encoding(false));
+        string sessionFile = Path.Combine(project, id + ".jsonl");
+        File.WriteAllText(sessionFile, row + "\n", new UTF8Encoding(false));
+        // Administrator-token runners may default the owner to Administrators.
+        // Give only this synthetic session file back to the current test user.
+        var info = new FileInfo(sessionFile);
+        var permissions = info.GetAccessControl();
+        permissions.SetOwner(WindowsIdentity.GetCurrent().User);
+        info.SetAccessControl(permissions);
         Console.Write("{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"synthetic answer\",\"session_id\":\"" + id + "\"}");
         return 0;
     }
@@ -222,6 +243,7 @@ class SyntheticCli {
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
         self.assertEqual(compiled.returncode, 0, "synthetic CLI compilation failed")
         self.other.write_text("unrelated synthetic session", encoding="utf-8")
+        self._set_fixture_owner(self.other)
         adapter = durable.DurableClaudeAdapter(str(executable), str(self.profile), str(self.work), str(state),
                                                "claude-synthetic", "medium", enabled=True,
                                                session_evidence=True, max_concurrency=1)
