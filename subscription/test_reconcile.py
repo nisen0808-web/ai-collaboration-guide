@@ -73,7 +73,10 @@ class SetupIssueTests(unittest.TestCase):
             written = short(str(launcher), buffer, len(buffer))
             if not written or os.path.normcase(buffer.value) == os.path.normcase(str(launcher)):
                 self.skipTest("short paths disabled")
-            self.assertEqual(os.path.normcase(ai_team._cli_path(buffer.value)), os.path.normcase(str(launcher)))
+            expanded = ai_team._cli_path(buffer.value)
+            self.assertTrue(os.path.samefile(expanded, launcher))
+            self.assertIn("a long synthetic launcher directory", expanded.lower())
+            self.assertEqual(Path(expanded).name.lower(), "synthetic launcher.exe")
 
 
 class ReconcileTests(unittest.TestCase):
