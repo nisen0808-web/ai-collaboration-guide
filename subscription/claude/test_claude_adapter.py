@@ -11,7 +11,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-from claude_adapter import ClaudeAdapter, child_environment, _NETWORK_ENV_NAMES
+from claude_adapter import ClaudeAdapter, child_environment, _NETWORK_ENV_NAMES, _model_quality
 
 
 class ClaudeAdapterTests(unittest.TestCase):
@@ -25,7 +25,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.options = (self.cli, self.profile, self.work, "model-example", "medium")
         self.auth = SimpleNamespace(returncode=0, stdout=json.dumps({"loggedIn": True,
             "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"}))
-        self.ok = SimpleNamespace(returncode=0, stdout=json.dumps({"is_error": False, "result": "synthetic response"}))
+        self.ok = SimpleNamespace(returncode=0, stdout=json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "synthetic response"}))
 
     def wait_job(self, adapter, job_id):
         for _ in range(100):
@@ -120,12 +120,110 @@ class ClaudeAdapterTests(unittest.TestCase):
             self.assertEqual(result["error"], "provider_reported_error")
             self.assertTrue(result["local_exit_confirmed"])
             self.assertNotIn("synthetic-sensitive", repr(result))
+            replay = adapter.submit("task", "error1")
+            self.assertEqual(replay, {"status": "not_submitted", "reason": "already_submitted",
+                                      "existing_status": "failed", "job_id": "error1", "replayed": True})
             for _ in range(100):
                 if adapter.status()["local_active"] == 0:
                     break
                 time.sleep(0.005)
             self.assertEqual(adapter.status()["local_active"], 0)
             self.assertEqual(started.call_count, 1)
+
+    def test_same_invocation_model_usage_is_narrowly_projected_without_effort_claim(self):
+        options = (self.cli, self.profile, self.work, "claude-example-1", "medium")
+        adapter = ClaudeAdapter(*options, enabled=True)
+        payload = {"type": "result", "subtype": "success", "is_error": False, "result": "synthetic response",
+                   "modelUsage": {"claude-example-1": {"inputTokens": 3, "outputTokens": 2,
+                                                         "private": "synthetic-private"}},
+                   "effort": "medium", "other": "synthetic-private"}
+        process = Mock(returncode=0)
+        process.communicate.return_value = (json.dumps(payload), "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process) as launched:
+            adapter.submit("synthetic task", "quality-job")
+            result = self.wait_job(adapter, "quality-job")
+        self.assertEqual(result["quality_verification"], {
+            "verified": False, "model_usage_matches_requested": True, "effort_verified": False,
+            "recorded_model": "claude-example-1", "evidence_source": "cli_result_model_usage"})
+        self.assertEqual(result["model_verification"], "unverified")
+        self.assertEqual(result["effort_verification"], "unverified")
+        self.assertNotIn("synthetic-private", repr(result))
+        self.assertIn("--no-session-persistence", launched.call_args.args[0])
+
+    def test_ambiguous_or_missing_usage_never_becomes_model_evidence(self):
+        valid = {"inputTokens": 1, "outputTokens": 2}
+        cases = [None, {}, [], {"claude-example-1": None}, {"claude-example-1": {}},
+                 {"claude-example-1": {"inputTokens": 0, "outputTokens": 0}},
+                 {"claude-example-1": {"inputTokens": True, "outputTokens": 1}},
+                 {"claude-example-1": {"inputTokens": -1, "outputTokens": 1}},
+                 {"claude-example-2": valid},
+                 {"claude-example-1": valid, "claude-example-2": valid},
+                 {"claude-example-1": {**valid, "canonicalModel": "claude-example-2"}}]
+        for usage in cases:
+            with self.subTest(usage=usage):
+                quality = _model_quality({"type": "result", "subtype": "success", "modelUsage": usage}, "claude-example-1")
+                self.assertFalse(quality["model_usage_matches_requested"])
+                self.assertFalse(quality["effort_verified"])
+                self.assertNotIn("recorded_model", quality)
+        self.assertFalse(_model_quality({"type": "result", "subtype": "success", "modelUsage": {"alias": valid}}, "alias")["model_usage_matches_requested"])
+        for field in ("type", "subtype"):
+            payload = {"type": "result", "subtype": "success", "modelUsage": {"claude-example-1": valid}}
+            del payload[field]
+            self.assertFalse(_model_quality(payload, "claude-example-1")["model_usage_matches_requested"])
+
+    def test_duplicate_json_members_cannot_become_usable_response(self):
+        options = (self.cli, self.profile, self.work, "claude-example-1", "medium")
+        adapter = ClaudeAdapter(*options, enabled=True)
+        process = Mock(returncode=0)
+        process.communicate.return_value = ('{"type":"result","subtype":"success","is_error":false,"result":"ok",'
+            '"modelUsage":{"claude-example-2":{"inputTokens":1,"outputTokens":1}},'
+            '"modelUsage":{"claude-example-1":{"inputTokens":1,"outputTokens":1}}}', "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process):
+            adapter.submit("task", "ambiguous")
+            result = self.wait_job(adapter, "ambiguous")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertEqual(result["error"], "invalid_provider_response")
+        self.assertNotIn("output", result)
+        self.assertNotIn("quality_verification", result)
+
+    def test_duplicate_success_and_auth_fields_are_rejected(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True)
+        duplicate_auth = SimpleNamespace(returncode=0, stdout='{"loggedIn":false,"loggedIn":true, '
+            '"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}')
+        with patch("claude_adapter.subprocess.run", return_value=duplicate_auth), \
+             patch("claude_adapter.subprocess.Popen", side_effect=AssertionError("must not launch")) as popen:
+            adapter.submit("task", "duplicate-auth")
+            self.assertEqual(self.wait_job(adapter, "duplicate-auth")["error"], "subscription_login_unavailable")
+            popen.assert_not_called()
+        for name, stdout in (("error", '{"is_error":true,"is_error":false,"result":"private"}'),
+                             ("result", '{"is_error":false,"result":"first","result":"private"}')):
+            with self.subTest(name=name):
+                process = Mock(returncode=0)
+                process.communicate.return_value = (stdout, "")
+                with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+                     patch("claude_adapter.subprocess.Popen", return_value=process):
+                    adapter.submit("task", "duplicate-" + name)
+                    result = self.wait_job(adapter, "duplicate-" + name)
+                self.assertEqual(result["status"], "submission_uncertain")
+                self.assertEqual(result["error"], "invalid_provider_response")
+                self.assertNotIn("output", result)
+                self.assertNotIn("private", repr(result))
+
+    def test_unknown_exit_cannot_become_success_or_model_evidence(self):
+        options = (self.cli, self.profile, self.work, "claude-example-1", "medium")
+        adapter = ClaudeAdapter(*options, enabled=True)
+        process = Mock(returncode=False)  # False == 0, but is not an exit code.
+        process.communicate.return_value = (json.dumps({"is_error": False, "result": "ok",
+                                                       "modelUsage": {"claude-example-1": {}}}), "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process):
+            adapter.submit("task", "exit-unknown")
+            result = self.wait_job(adapter, "exit-unknown")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertFalse(result["local_exit_confirmed"])
+        self.assertNotIn("quality_verification", result)
 
     def test_missing_error_flag_is_uncertain_not_reported_failure(self):
         adapter = ClaudeAdapter(*self.options, enabled=True)
@@ -139,6 +237,45 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(result["error"], "invalid_provider_response")
         self.assertTrue(result["local_exit_confirmed"])
 
+    def test_result_requires_noncontradictory_official_success_shape(self):
+        valid = {"type": "result", "subtype": "success", "is_error": False, "result": "private synthetic"}
+        cases = ({**valid, "type": "assistant"}, {**valid, "subtype": "error_max_turns"},
+                 {**valid, "subtype": "future_unknown"}, {**valid, "is_error": True},
+                 {**valid, "result": None},
+                 {key: value for key, value in valid.items() if key != "type"},
+                 {key: value for key, value in valid.items() if key != "subtype"})
+        for index, payload in enumerate(cases):
+            with self.subTest(index=index):
+                adapter = ClaudeAdapter(*self.options, enabled=True)
+                process = Mock(returncode=0)
+                process.communicate.return_value = (json.dumps(payload), "")
+                with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+                     patch("claude_adapter.subprocess.Popen", return_value=process) as popen:
+                    adapter.submit("task", "invalid-success")
+                    result = self.wait_job(adapter, "invalid-success")
+                self.assertEqual(result["status"], "submission_uncertain")
+                self.assertEqual(result["error"], "invalid_provider_response")
+                self.assertTrue(result["local_exit_confirmed"])
+                self.assertNotIn("output", result)
+                self.assertNotIn("private synthetic", repr(result))
+                self.assertEqual(popen.call_count, 1)
+
+    def test_known_error_shape_stays_failed_without_exposing_body(self):
+        for subtype in ("error_max_turns", "error_during_execution", "error_max_budget_usd",
+                        "error_max_structured_output_retries"):
+            with self.subTest(subtype=subtype):
+                adapter = ClaudeAdapter(*self.options, enabled=True)
+                process = Mock(returncode=1)
+                process.communicate.return_value = (json.dumps({"type": "result", "subtype": subtype,
+                    "is_error": True, "errors": ["private synthetic"]}), "")
+                with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+                     patch("claude_adapter.subprocess.Popen", return_value=process):
+                    adapter.submit("task", "error-shape")
+                    result = self.wait_job(adapter, "error-shape")
+                self.assertEqual(result["status"], "failed")
+                self.assertEqual(result["error"], "provider_reported_error")
+                self.assertNotIn("private synthetic", repr(result))
+
     def test_nonzero_unstructured_error_remains_uncertain(self):
         adapter = ClaudeAdapter(*self.options, enabled=True)
         process = Mock(returncode=1)
@@ -150,6 +287,53 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(result["status"], "submission_uncertain")
         self.assertTrue(result["local_exit_confirmed"])
         self.assertNotIn("synthetic-sensitive", repr(result))
+
+    def test_communication_failure_keeps_slot_when_child_exit_is_unknown(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, max_concurrency=1)
+        process = Mock(returncode=None)
+        process.communicate.side_effect = OSError("synthetic-private")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process) as popen:
+            adapter.submit("task", "unknown-child")
+            result = self.wait_job(adapter, "unknown-child")
+            self.assertEqual(result["status"], "submission_uncertain")
+            self.assertFalse(result["local_exit_confirmed"])
+            self.assertEqual(adapter.submit("task", "unknown-child")["status"], "submission_uncertain")
+            self.assertEqual(adapter.submit("other task", "other")["reason"], "provider_busy")
+            self.assertEqual(adapter.status()["local_active"], 1)
+            self.assertEqual(popen.call_count, 1)
+        process.kill.assert_not_called()
+        process.terminate.assert_not_called()
+        self.assertNotIn("synthetic-private", repr(result))
+
+    def test_spawn_failure_keeps_slot_when_child_creation_is_unknown(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, max_concurrency=1)
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", side_effect=OSError("synthetic-private")) as popen:
+            adapter.submit("task", "unknown-spawn")
+            result = self.wait_job(adapter, "unknown-spawn")
+            self.assertEqual(result["status"], "submission_uncertain")
+            self.assertFalse(result["local_exit_confirmed"])
+            self.assertEqual(adapter.submit("other", "other")["reason"], "provider_busy")
+            self.assertEqual(adapter.status()["local_active"], 1)
+            self.assertEqual(popen.call_count, 1)
+
+    def test_confirmed_exit_releases_slot_even_if_remote_result_uncertain(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, max_concurrency=1)
+        process = Mock(returncode=1)
+        process.communicate.return_value = ("not json", "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process) as popen:
+            adapter.submit("task", "finished-uncertain")
+            result = self.wait_job(adapter, "finished-uncertain")
+            self.assertEqual(result["status"], "submission_uncertain")
+            self.assertTrue(result["local_exit_confirmed"])
+            for _ in range(100):
+                if adapter.status()["local_active"] == 0:
+                    break
+                time.sleep(.005)
+            self.assertEqual(adapter.status()["local_active"], 0)
+            self.assertEqual(popen.call_count, 1)
 
     def test_structured_error_without_confirmed_exit_stays_uncertain(self):
         adapter = ClaudeAdapter(*self.options, enabled=True)
@@ -171,6 +355,11 @@ class ClaudeAdapterTests(unittest.TestCase):
             result = self.wait_job(adapter, "id3")
         self.assertEqual(result, {"status": "failed", "error": "subscription_login_unavailable"})
         self.assertEqual(run.call_count, 1)
+        for _ in range(100):
+            if adapter.status()["local_active"] == 0:
+                break
+            time.sleep(.005)
+        self.assertEqual(adapter.status()["local_active"], 0)
 
     def test_slow_process_completes_without_kill_or_resubmission(self):
         adapter = ClaudeAdapter(*self.options, enabled=True)
@@ -191,6 +380,7 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.assertEqual(result["status"], "submission_uncertain")
                 self.assertEqual(result["error"], "provider_slow")
                 replay = adapter.submit("task", "id4")
+                self.assertEqual(replay["status"], "submission_uncertain")
                 release.set()
                 for _ in range(100):
                     result = adapter.poll("id4")
@@ -219,7 +409,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         spawned = []
         def fake_cli(_command, **kwargs):
             code = ("import sys,time,json; data=sys.stdin.read(); time.sleep(.4); "
-                    "print(json.dumps({'is_error': False, 'result': data}))")
+                    "print(json.dumps({'type': 'result', 'subtype': 'success', 'is_error': False, 'result': data}))")
             process = original_popen([sys.executable, "-c", code], **kwargs)
             spawned.append(process)
             return process
@@ -257,6 +447,41 @@ class ClaudeAdapterTests(unittest.TestCase):
             self.assertEqual(adapter.submit("task two", "id6")["reason"], "task_id_conflict")
         self.assertEqual(start.call_count, 1)
 
+    def test_replay_queued_preserves_original_job_without_starting_again(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True)
+        with patch.object(threading.Thread, "start") as start:
+            self.assertEqual(adapter.submit("synthetic task", "queued-job")["status"], "queued")
+            replay = adapter.submit("synthetic task", "queued-job")
+        self.assertEqual(replay, {"status": "queued", "job_id": "queued-job", "replayed": True})
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(adapter.status()["local_active"], 1)
+
+    def test_replay_unknown_state_is_uncertain_and_keeps_capacity(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, max_concurrency=1)
+        with patch.object(threading.Thread, "start") as start:
+            adapter.submit("synthetic task", "unknown-state")
+            adapter._update("unknown-state", status="future-state")
+            replay = adapter.submit("synthetic task", "unknown-state")
+        self.assertEqual(replay, {"status": "submission_uncertain", "job_id": "unknown-state", "replayed": True})
+        self.assertEqual(start.call_count, 1)
+        self.assertEqual(adapter.status()["local_active"], 1)
+
+    def test_replay_succeeded_keeps_original_job_without_resubmission(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True)
+        process = Mock(returncode=0)
+        process.communicate.return_value = (self.ok.stdout, "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process) as popen:
+            adapter.submit("synthetic task", "finished-job")
+            self.assertEqual(self.wait_job(adapter, "finished-job")["status"], "succeeded")
+            replay = adapter.submit("synthetic task", "finished-job")
+            conflict = adapter.submit("different task", "finished-job")
+        self.assertEqual(replay, {"status": "not_submitted", "reason": "already_submitted",
+                                  "existing_status": "succeeded", "job_id": "finished-job", "replayed": True})
+        self.assertEqual(conflict["reason"], "task_id_conflict")
+        self.assertEqual(popen.call_count, 1)
+        self.assertEqual(adapter.poll("finished-job")["output"], "synthetic response")
+
     def test_two_jobs_run_concurrently_busy_is_not_submitted_and_slots_release(self):
         adapter = ClaudeAdapter(*self.options, enabled=True)
         release = threading.Event()
@@ -287,7 +512,10 @@ class ClaudeAdapterTests(unittest.TestCase):
                 self.assertEqual(adapter.status()["local_limit"], 2)
                 self.assertEqual(adapter.submit("task three", "concurrent-3"),
                                  {"status": "not_submitted", "reason": "provider_busy"})
-                self.assertTrue(adapter.submit("task one", "concurrent-1")["replayed"])
+                replay = adapter.submit("task one", "concurrent-1")
+                self.assertTrue(replay["replayed"])
+                self.assertEqual(replay["status"], "running")
+                self.assertEqual(replay["job_id"], "concurrent-1")
                 self.assertEqual(popen.call_count, 2)
                 release.set()
                 self.assertEqual(self.wait_job(adapter, "concurrent-1")["status"], "succeeded")

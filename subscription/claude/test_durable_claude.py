@@ -234,6 +234,77 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(output["output"], "synthetic result")
         self.assertNotIn(b"synthetic prompt", (self.state / "jobs.sqlite3").read_bytes())
 
+    def test_worker_persists_only_narrow_model_usage_evidence_and_old_records_work(self):
+        a = self.adapter()
+        self.insert("new-result", "reserved")
+        message = {"task": "synthetic prompt", "cli_path": str(self.cli),
+                   "profile_dir": str(self.profile), "work_dir": str(self.work),
+                   "model": "claude-example-1", "effort": "medium", "timeout_seconds": 900}
+        class FakeAdapter:
+            def __init__(self, *_args, **_kwargs): pass
+            def submit(self, task, task_id): return {"status": "queued", "job_id": task_id}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "synthetic response", "local_exit_confirmed": True,
+                        "quality_verification": {"verified": True, "effort_verified": True,
+                            "model_usage_matches_requested": True, "recorded_model": "claude-example-1",
+                            "evidence_source": "cli_result_model_usage", "private": "synthetic-private"}}
+        fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
+        with patch("durable_claude.ClaudeAdapter", FakeAdapter), patch("durable_claude.sys.stdin", fake_stdin):
+            durable._run_worker(str(self.state), "new-result")
+        # A new adapter has different current settings: old job evidence is frozen.
+        result = self.adapter().poll("new-result")
+        self.assertEqual(result["quality_verification"], {"verified": False, "effort_verified": False,
+            "model_usage_matches_requested": True, "recorded_model": "claude-example-1",
+            "evidence_source": "cli_result_model_usage"})
+        self.assertEqual(result["model_verification"], "unverified")
+        raw = (self.state / "new-result.result.json").read_text(encoding="utf-8")
+        self.assertNotIn("synthetic-private", raw)
+        self.assertNotIn("synthetic prompt", raw)
+
+        self.insert("legacy", "succeeded")
+        (self.state / "legacy.result.json").write_text(json.dumps({"output": "legacy"}), encoding="utf-8")
+        with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
+            with con:
+                con.execute("UPDATE jobs SET output_file=? WHERE id=?", ("legacy.result.json", "legacy"))
+        legacy = a.poll("legacy")
+        self.assertEqual(legacy["status"], "succeeded")
+        self.assertFalse(legacy["quality_verification"]["model_usage_matches_requested"])
+        self.assertFalse(legacy["quality_verification"]["effort_verified"])
+
+    def test_unrecognized_stored_model_evidence_is_not_forwarded(self):
+        a = self.adapter()
+        self.insert("invalid-evidence", "succeeded")
+        (self.state / "invalid-evidence.result.json").write_text(json.dumps({"output": "ok",
+            "quality_verification": {"model_usage_matches_requested": True, "recorded_model": "synthetic-private",
+                                     "evidence_source": "synthetic-private"}}), encoding="utf-8")
+        with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
+            with con:
+                con.execute("UPDATE jobs SET output_file=? WHERE id=?", ("invalid-evidence.result.json", "invalid-evidence"))
+        result = a.poll("invalid-evidence")
+        self.assertFalse(result["quality_verification"]["model_usage_matches_requested"])
+        self.assertNotIn("synthetic-private", repr(result))
+
+    def test_worker_refuses_model_evidence_mismatched_with_frozen_request(self):
+        a = self.adapter()
+        self.insert("mismatch", "reserved")
+        message = {"task": "synthetic prompt", "cli_path": str(self.cli),
+                   "profile_dir": str(self.profile), "work_dir": str(self.work),
+                   "model": "claude-example-1", "effort": "medium", "timeout_seconds": 900}
+        class FakeAdapter:
+            def __init__(self, *_args, **_kwargs): pass
+            def submit(self, task, task_id): return {"status": "queued", "job_id": task_id}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                    "model_usage_matches_requested": True, "recorded_model": "claude-example-2",
+                    "evidence_source": "cli_result_model_usage"}}
+        fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
+        with patch("durable_claude.ClaudeAdapter", FakeAdapter), patch("durable_claude.sys.stdin", fake_stdin):
+            durable._run_worker(str(self.state), "mismatch")
+        result = a.poll("mismatch")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertFalse(result["quality_verification"]["model_usage_matches_requested"])
+        self.assertNotIn("recorded_model", result["quality_verification"])
+
     def test_synthetic_launcher_timeout_does_not_expose_command(self):
         nested = DurableTests("test_parent_exit_then_new_adapter_recovers_fake_worker_result")
         result = unittest.TestResult()

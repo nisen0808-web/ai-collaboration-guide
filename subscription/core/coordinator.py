@@ -39,7 +39,8 @@ POLL_ERRORS = frozenset({
     "provider_reported_error", "provider_slow", "provider_result_unavailable",
     "inspection_unavailable", "unexpected_or_unknown_extensions", "process_still_running",
     "cli_failed", "empty_result", "execution_unverified", "job_state_unavailable",
-    "worker_error", "worker_identity_unconfirmed", "worker_start_unconfirmed",
+    "worker_error", "worker_unavailable", "worker_setup_failed", "input_too_large",
+    "worker_identity_unconfirmed", "worker_start_unconfirmed",
     "worker_request_invalid", "dispatch_interrupted", "state_write_failed",
 })
 INSPECTION_REASONS = frozenset({
@@ -348,12 +349,36 @@ class Coordinator:
         # deliberately small set of primitive verification fields only.
         quality = response.get("quality_verification")
         if isinstance(quality, dict):
-            allowed = {"actual_model", "actual_effort", "verified", "evidence_source"}
-            safe = {key: quality[key] for key in allowed if key in quality and
-                    ((isinstance(quality[key], str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", quality[key])) or isinstance(quality[key], bool))}
+            flags = {"verified"}
+            strings = {"actual_model", "actual_effort", "evidence_source"}
+            safe = {key: quality[key] for key in flags if type(quality.get(key)) is bool}
+            safe.update({key: quality[key] for key in strings if isinstance(quality.get(key), str)
+                         and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", quality[key])})
+            if provider == "claude":
+                # The current CLI JSON does not attest the effort used for
+                # the response; adapter claims cannot promote it to verified.
+                safe["verified"] = False
+                safe["effort_verified"] = False
+                safe.pop("actual_effort", None)
+                safe.pop("actual_model", None)
+                safe["model_usage_matches_requested"] = None
+                # Never pass through an untrusted or contradictory source.
+                safe["evidence_source"] = "not_verified"
+            if provider == "claude" and "model_usage_matches_requested" in quality:
+                model = quality.get("recorded_model")
+                valid_model_evidence = (quality["model_usage_matches_requested"] is True
+                        and quality.get("evidence_source") == "cli_result_model_usage"
+                        and isinstance(model, str) and bool(re.fullmatch(r"claude-[A-Za-z0-9][A-Za-z0-9._-]{0,89}", model)))
+                safe["model_usage_matches_requested"] = True if valid_model_evidence else None
+                if valid_model_evidence:
+                    safe["recorded_model"] = model
+                    safe["evidence_source"] = "cli_result_model_usage"
             safe["reported_by_adapter"] = True
             safe["independently_verified_by_coordinator"] = False
             result["quality_verification"] = safe
         elif actual == "succeeded":
             result["quality_verification"] = {"verified": False, "evidence_source": "not_verified"}
+            if provider == "claude":
+                result["quality_verification"].update(model_usage_matches_requested=None,
+                                                       effort_verified=False)
         return result

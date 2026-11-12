@@ -20,11 +20,11 @@ import threading
 import time
 
 if __package__:
-    from .claude_adapter import ClaudeAdapter, child_environment, _absolute
+    from .claude_adapter import ClaudeAdapter, child_environment, _absolute, _stored_model_quality
 else:
     # Detached execution uses this file as a script; Python then adds its
     # containing directory rather than the package parent to sys.path.
-    from claude_adapter import ClaudeAdapter, child_environment, _absolute
+    from claude_adapter import ClaudeAdapter, child_environment, _absolute, _stored_model_quality
 
 _TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
 _WORKER_SCRIPT = str(Path(__file__).resolve())
@@ -242,8 +242,10 @@ class DurableClaudeAdapter:
                 result = json.loads(path.read_text(encoding="utf-8"))
                 if not isinstance(result, dict) or not isinstance(result.get("output"), str):
                     raise ValueError("invalid result")
+                quality = _stored_model_quality(result.get("quality_verification"))
                 return {"status": "succeeded", "output": result["output"],
-                        "model_verification": "unverified", "effort_verification": "unverified"}
+                        "model_verification": "unverified",
+                        "effort_verification": "unverified", "quality_verification": quality}
             except (OSError, ValueError):
                 return {"status": "submission_uncertain", "error": "result_unavailable"}
         if status == "reserved" or (status in ("queued", "running") and (not heartbeat or time.time() - heartbeat > 10)):
@@ -287,7 +289,8 @@ def _run_worker(state_dir: str, job_id: str) -> None:
             if status == "succeeded":
                 filename = job_id + ".result.json"
                 try:
-                    _atomic_json(state / filename, {"output": result["output"]})
+                    _atomic_json(state / filename, {"output": result["output"],
+                                 "quality_verification": _stored_model_quality(result.get("quality_verification"), message["model"])})
                 except Exception:
                     # A completed provider result could not be saved. Never
                     # expose it as a usable result or launch the job again.

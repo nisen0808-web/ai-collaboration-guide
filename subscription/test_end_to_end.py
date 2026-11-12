@@ -65,7 +65,7 @@ class EndToEndTests(unittest.TestCase):
                 returncode = 0
 
                 def communicate(self, input=None, timeout=None):
-                    return json.dumps({"is_error": False, "result": "claude result"}), ""
+                    return json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "claude result"}), ""
 
             def fake_popen(argv, **kwargs):
                 if argv[0] == str(claude_cli):

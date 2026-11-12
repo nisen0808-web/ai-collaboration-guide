@@ -16,6 +16,8 @@ import subprocess
 import threading
 
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\Z")
+_EVIDENCE_MODEL = re.compile(r"claude-[A-Za-z0-9][A-Za-z0-9._-]{0,89}\Z")
+_MODEL_SOURCE = "cli_result_model_usage"
 _TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
 _EFFORTS = frozenset({"low", "medium", "high", "max"})
 _NETWORK_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
@@ -72,6 +74,62 @@ def _subscription_login(payload: object) -> bool:
     return (method in _CLAUDE_ACCOUNT or (method == "oauth" and provider == "firstparty")) and provider in {"", "firstparty"} and plan in _PLANS
 
 
+def _model_quality(payload: object, requested_model: str) -> dict:
+    """Project exact single-model CLI evidence; do not infer effort or aliases.
+
+    Only call on this invocation's successful, confirmed-exit JSON result.
+    The selected CLI is trusted; this does not authenticate the executable.
+    """
+    quality = {"verified": False, "model_usage_matches_requested": None,
+               "effort_verified": False, "evidence_source": "not_verified"}
+    if not isinstance(requested_model, str) or not _EVIDENCE_MODEL.fullmatch(requested_model):
+        return quality
+    if not isinstance(payload, dict) or payload.get("type") != "result" or payload.get("subtype") != "success":
+        return quality
+    usage = payload.get("modelUsage")
+    if not isinstance(usage, dict) or len(usage) != 1 or requested_model not in usage:
+        return quality
+    model_usage = usage[requested_model]
+    if not isinstance(model_usage, dict):
+        return quality
+    input_tokens, output_tokens = model_usage.get("inputTokens"), model_usage.get("outputTokens")
+    if (type(input_tokens) is not int or type(output_tokens) is not int
+            or input_tokens < 0 or output_tokens < 0 or input_tokens + output_tokens <= 0):
+        return quality
+    canonical = model_usage.get("canonicalModel", requested_model)
+    if canonical != requested_model:
+        return quality
+    quality.update(model_usage_matches_requested=True, recorded_model=requested_model, evidence_source=_MODEL_SOURCE)
+    return quality
+
+
+def _unambiguous_json(text: str) -> object:
+    """Reject duplicate object members in official CLI JSON responses."""
+    def unique_pairs(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("ambiguous JSON")
+            result[key] = value
+        return result
+    return json.loads(text, object_pairs_hook=unique_pairs)
+
+
+def _stored_model_quality(value: object, requested_model: str | None = None) -> dict:
+    """Validate the private durable file's narrow evidence projection."""
+    unknown = {"verified": False, "model_usage_matches_requested": None,
+               "effort_verified": False, "evidence_source": "not_verified"}
+    if not isinstance(value, dict) or value.get("model_usage_matches_requested") is not True:
+        return unknown
+    model = value.get("recorded_model")
+    if (not isinstance(model, str) or not _EVIDENCE_MODEL.fullmatch(model)
+            or value.get("evidence_source") != _MODEL_SOURCE
+            or (requested_model is not None and model != requested_model)):
+        return unknown
+    return {"verified": False, "model_usage_matches_requested": True, "effort_verified": False,
+            "recorded_model": model, "evidence_source": _MODEL_SOURCE}
+
+
 class ClaudeAdapter:
     """In-process asynchronous text worker; no durable replay after restart.
 
@@ -115,7 +173,13 @@ class ClaudeAdapter:
             if task_id in self._jobs:
                 if self._jobs[task_id]["digest"] != digest:
                     return {"status": "not_submitted", "reason": "task_id_conflict"}
-                return {"status": "queued", "job_id": task_id, "replayed": True}
+                prior = self._jobs[task_id].get("status")
+                if prior in ("queued", "running", "submission_uncertain"):
+                    return {"status": prior, "job_id": task_id, "replayed": True}
+                if prior in ("succeeded", "failed"):
+                    return {"status": "not_submitted", "reason": "already_submitted",
+                            "job_id": task_id, "replayed": True, "existing_status": prior}
+                return {"status": "submission_uncertain", "job_id": task_id, "replayed": True}
             if self._active >= self.max_concurrency:
                 return {"status": "not_submitted", "reason": "provider_busy"}
             self._active += 1
@@ -174,7 +238,13 @@ class ClaudeAdapter:
             self._update(job_id, status="submission_uncertain", error="worker_error")
         finally:
             with self._lock:
-                self._active -= 1
+                job = self._jobs[job_id]
+                known_prelaunch_failure = (job.get("status") == "failed" and job.get("error") in
+                                           {"subscription_login_unavailable", "preflight_error"})
+                # Never free a slot merely because the local worker stopped:
+                # a child may still exist after a spawn or communicate error.
+                if known_prelaunch_failure or job.get("local_exit_confirmed") is True:
+                    self._active -= 1
 
     def _run_worker(self, job_id: str, task: str) -> None:
         try:
@@ -184,7 +254,7 @@ class ClaudeAdapter:
                                   capture_output=True, cwd=self.work_dir, env=env, timeout=20,
                                   shell=False, text=True, encoding="utf-8", errors="replace",
                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            if auth.returncode != 0 or not _subscription_login(json.loads(auth.stdout)):
+            if auth.returncode != 0 or not _subscription_login(_unambiguous_json(auth.stdout)):
                 self._update(job_id, status="failed", error="subscription_login_unavailable")
                 return
         except (OSError, ValueError, subprocess.TimeoutExpired):
@@ -220,28 +290,35 @@ class ClaudeAdapter:
             # exits nonzero. Never forward its body, which may contain secrets.
             # Other nonzero, malformed, or incomplete results stay uncertain.
             try:
-                payload = json.loads(stdout)
+                payload = _unambiguous_json(stdout)
             except (TypeError, ValueError):
                 payload = None
             if isinstance(payload, dict) and payload.get("is_error") is True:
-                self._update(job_id, status="failed" if process_exit_confirmed else "submission_uncertain",
-                             error="provider_reported_error",
+                error_subtypes = {"error_max_turns", "error_during_execution", "error_max_budget_usd",
+                                  "error_max_structured_output_retries"}
+                subtype = payload.get("subtype")
+                structured_error = (payload.get("type") in (None, "result")
+                                    and (subtype is None or
+                                         (payload.get("type") == "result" and isinstance(subtype, str)
+                                          and subtype in error_subtypes)))
+                self._update(job_id, status="failed" if process_exit_confirmed and structured_error else "submission_uncertain",
+                             error="provider_reported_error" if structured_error else "invalid_provider_response",
                              local_exit_confirmed=process_exit_confirmed)
                 return
-            if process.returncode != 0:
+            if not process_exit_confirmed or process.returncode != 0:
                 self._update(job_id, status="submission_uncertain", error="provider_process_failed",
                              local_exit_confirmed=process_exit_confirmed)
                 return
-            if not isinstance(payload, dict) or not isinstance(payload.get("result"), str):
+            if (not isinstance(payload, dict) or payload.get("type") != "result"
+                    or payload.get("subtype") != "success" or payload.get("is_error") is not False
+                    or not isinstance(payload.get("result"), str)):
                 self._update(job_id, status="submission_uncertain", error="invalid_provider_response",
                              local_exit_confirmed=process_exit_confirmed)
                 return
-            if payload.get("is_error") is not False:
-                self._update(job_id, status="submission_uncertain", error="invalid_provider_response",
-                             local_exit_confirmed=process_exit_confirmed)
-                return
+            quality = _model_quality(payload, self.model)
             self._update(job_id, status="succeeded", output=payload["result"],
-                         model_verification="unverified", effort_verification="unverified",
+                         model_verification="unverified",
+                         effort_verification="unverified", quality_verification=quality,
                          local_exit_confirmed=process_exit_confirmed)
         except (OSError, ValueError, subprocess.TimeoutExpired):
             self._update(job_id, status="submission_uncertain", error="provider_result_unavailable",

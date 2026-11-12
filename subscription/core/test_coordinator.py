@@ -428,6 +428,105 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         self.assertEqual(c.result("claude", "key")["status"], "submission_uncertain")
         with self.assertRaises(InputError): c.result("grok", "key")
 
+    def test_partial_cli_model_evidence_is_exposed_without_private_metadata_or_effort_claim(self):
+        class Adapter:
+            def submit(self, **kwargs): return {"status": "queued", "job_id": "job"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                    "verified": False, "model_usage_matches_requested": True,
+                    "effort_verified": False, "recorded_model": "claude-example-1",
+                    "evidence_source": "cli_result_model_usage", "private": "synthetic-private"}}
+        c = Coordinator(self.db, {"claude": Adapter()})
+        c.submit("claude", "task", "quality-key")
+        quality = c.result("claude", "quality-key")["quality_verification"]
+        self.assertTrue(quality["model_usage_matches_requested"])
+        self.assertEqual(quality["recorded_model"], "claude-example-1")
+        self.assertFalse(quality["verified"])
+        self.assertFalse(quality["effort_verified"])
+        self.assertFalse(quality["independently_verified_by_coordinator"])
+        self.assertNotIn("synthetic-private", repr(quality))
+        self.assertNotIn("actual_effort", quality)
+
+    def test_invalid_model_evidence_does_not_claim_a_match(self):
+        class Adapter:
+            def submit(self, **kwargs): return {"status": "queued", "job_id": "job"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                    "verified": False, "model_usage_matches_requested": True,
+                    "recorded_model": "synthetic-private", "evidence_source": "cli_result_model_usage"}}
+        c = Coordinator(self.db, {"claude": Adapter()})
+        c.submit("claude", "task", "invalid-quality-key")
+        quality = c.result("claude", "invalid-quality-key")["quality_verification"]
+        self.assertIsNone(quality["model_usage_matches_requested"])
+        self.assertNotIn("recorded_model", quality)
+        self.assertEqual(quality["evidence_source"], "not_verified")
+        self.assertNotIn("synthetic-private", repr(quality))
+
+    def test_claude_durable_fixed_poll_errors_survive_coordinator_without_arbitrary_text(self):
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from claude import durable_claude
+            root = Path(self.tmp.name)
+            state, profile, work, cli = (root / name for name in ("claude-state", "profile", "work", "cli"))
+            for directory in (state, profile, work):
+                directory.mkdir()
+            adapter = durable_claude.DurableClaudeAdapter(str(cli), str(profile), str(work), str(state),
+                                                          "model-example", "medium", enabled=True)
+            c = Coordinator(self.db, {"claude": adapter})
+            for index, error in enumerate(("worker_unavailable", "worker_setup_failed", "input_too_large",
+                                           "synthetic-private")):
+                with self.subTest(error=error):
+                    job_id, key = "job-" + str(index), "key-" + str(index)
+                    with durable_claude._connect(adapter.db) as con:
+                        con.execute("INSERT INTO jobs VALUES (?,?,?, ?,NULL,NULL)",
+                                    (job_id, "digest", "failed", error))
+                    with patch.object(adapter, "submit", return_value={"status": "queued", "job_id": job_id}):
+                        c.submit("claude", "task", key)
+                    result = c.result("claude", key)
+                    self.assertEqual(result["status"], "failed")
+                    if error == "synthetic-private":
+                        self.assertNotIn("error", result)
+                        self.assertNotIn(error, repr(result))
+                    else:
+                        self.assertEqual(result["error"], error)
+        finally:
+            sys.path.remove(package_root)
+
+    def test_claude_adapter_cannot_claim_effort_or_overall_verification(self):
+        class Adapter:
+            def submit(self, **kwargs): return {"status": "queued", "job_id": "job"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                    "verified": True, "effort_verified": True, "actual_effort": "medium",
+                    "actual_model": "claude-conflicting-model", "model_usage_matches_requested": True,
+                    "recorded_model": "claude-example-1", "evidence_source": "cli_result_model_usage"}}
+        c = Coordinator(self.db, {"claude": Adapter()})
+        c.submit("claude", "task", "effort-key")
+        quality = c.result("claude", "effort-key")["quality_verification"]
+        self.assertFalse(quality["verified"])
+        self.assertFalse(quality["effort_verified"])
+        self.assertNotIn("actual_effort", quality)
+        self.assertNotIn("actual_model", quality)
+        self.assertEqual(quality["recorded_model"], "claude-example-1")
+
+    def test_unproven_claude_actual_model_is_not_forwarded(self):
+        class Adapter:
+            def submit(self, **kwargs): return {"status": "queued", "job_id": "job"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                    "actual_model": "claude-unproven-model", "verified": True,
+                    "evidence_source": "synthetic-private"}}
+        c = Coordinator(self.db, {"claude": Adapter()})
+        c.submit("claude", "task", "unproven-model-key")
+        quality = c.result("claude", "unproven-model-key")["quality_verification"]
+        self.assertNotIn("actual_model", quality)
+        self.assertNotIn("recorded_model", quality)
+        self.assertFalse(quality["verified"])
+        self.assertIsNone(quality["model_usage_matches_requested"])
+        self.assertEqual(quality["evidence_source"], "not_verified")
+        self.assertNotIn("synthetic-private", repr(quality))
+
     def test_uncertain_with_job_id_can_be_queried_without_resubmission(self):
         class Adapter:
             def __init__(self): self.submits = 0

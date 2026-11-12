@@ -115,7 +115,7 @@ class ConfirmedExitTests(unittest.TestCase):
         class FakeProcess:
             returncode = 0
             def communicate(self, **kwargs):
-                return json.dumps({"is_error": False, "result": "synthetic"}), ""
+                return json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "synthetic"}), ""
         with patch.object(claude_adapter.subprocess, "run", return_value=auth), \
              patch.object(claude_adapter.subprocess, "Popen", return_value=FakeProcess()):
             adapter._run_worker("job-1", "synthetic")
