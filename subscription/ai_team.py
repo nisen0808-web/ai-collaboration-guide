@@ -341,7 +341,7 @@ def main(argv: list[str] | None = None) -> int:
             codex_home = codex_home.resolve()
             codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
             global_marker = codex_home / ".ai-collaboration-guide-install-attempt"
-            previous_attempt = ("A previous installation attempt exists. No server was added; "
+            previous_attempt = ("A previous installation attempt exists. This attempt did not add a server; "
                                 "check Codex and the installation markers before making changes.")
             if os.path.lexists(global_marker):
                 print(previous_attempt, file=sys.stderr)
@@ -379,7 +379,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
-                print("A previous installation attempt exists. No server was added; "
+                print("A previous installation attempt exists. This attempt did not add a server; "
                       "check Codex before removing codex-install-attempt.txt "
                       "from this tool's data directory and trying again.", file=sys.stderr)
                 return 1

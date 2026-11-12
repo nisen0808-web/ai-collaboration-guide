@@ -428,7 +428,7 @@ class EntryPointTests(unittest.TestCase):
                  redirect_stderr(stderr):
                 self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp]), 1)
             self.assertEqual(marker.read_text(encoding="utf-8"), "opaque existing content")
-            self.assertIn("No server was added", stderr.getvalue())
+            self.assertIn("This attempt did not add a server", stderr.getvalue())
             self.assertNotIn("opaque existing content", stderr.getvalue())
 
     def test_install_pins_relative_paths_for_a_different_startup_directory(self):
