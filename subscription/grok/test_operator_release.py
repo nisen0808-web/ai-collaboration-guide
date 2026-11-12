@@ -281,6 +281,21 @@ class OperatorReleaseTests(unittest.TestCase):
         self.assertEqual(subject.blocking_jobs(str(root)), [])
         self.assertFalse((root / "grok-jobs").exists())
 
+    def test_ignored_release_rolls_back_trigger_side_effects(self):
+        target = self.insert("running", "running", pid=42, identity="42:123")
+        other = self.insert("running", "running", pid=43, identity="43:123")
+        with closing(sqlite3.connect(self.root / "grok-jobs.sqlite3")) as con, con:
+            con.execute("CREATE TRIGGER ignored BEFORE UPDATE OF state ON jobs "
+                        "WHEN OLD.state='running' BEGIN "
+                        "UPDATE jobs SET result_json='tampered' WHERE job_id<>OLD.job_id; "
+                        "SELECT RAISE(IGNORE); END")
+            before = con.execute("SELECT * FROM jobs ORDER BY job_id").fetchall()
+        with mock.patch.object(subject, "_worker_identity_state", return_value="exited"):
+            self.assertEqual(subject.operator_release(str(self.root), target), "unsafe_state")
+        with closing(sqlite3.connect(self.root / "grok-jobs.sqlite3")) as con:
+            self.assertEqual(con.execute("SELECT * FROM jobs ORDER BY job_id").fetchall(), before)
+            self.assertIsNotNone(con.execute("SELECT 1 FROM jobs WHERE job_id=?", (other,)).fetchone())
+
 
 if __name__ == "__main__":
     unittest.main()

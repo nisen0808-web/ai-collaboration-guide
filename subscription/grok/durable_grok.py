@@ -448,7 +448,12 @@ class _Ledger:
                                   "AND result_json IS ?",
                                   ("operator_released", json.dumps(released), job_id,
                                    row["state"], row["result_json"])).rowcount
-        return "released" if changed == 1 else "not_blocking"
+            if changed != 1:
+                # Roll back trigger side effects as well. Zero changed rows is
+                # not evidence that the task no longer occupies a slot.
+                con.rollback()
+                return "unsafe_state"
+        return "released"
 
     def find_job(self, task_id: str) -> str | None:
         if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128:

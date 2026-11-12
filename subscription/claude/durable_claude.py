@@ -226,8 +226,13 @@ def operator_release(state_dir, job_id: str) -> str:
             return "identity_unconfirmed"
         changed = con.execute("UPDATE jobs SET status='operator_released',error='operator_released' "
                               "WHERE id=? AND status=?", (job_id, row["status"])).rowcount
+        if changed != 1:
+            # A trigger can modify other rows and then ignore this update.
+            # Roll back all effects; zero changes is not proof of no blocker.
+            con.rollback()
+            return "unsafe_state"
         con.commit()
-        return "released" if changed == 1 else "not_blocking"
+        return "released"
     finally:
         con.close()
 
