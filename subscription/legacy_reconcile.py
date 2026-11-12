@@ -99,10 +99,9 @@ def _snapshot(con, provider, job_id):
     state = row[names.index(state_key)]
     contradictory_exit = (provider == "claude" and state == "finished_uncertain"
                           and row[names.index("error")] in _EXIT_UNCONFIRMED)
-    # Grok's durable reader treats a finished state whose body lacks a strict
-    # true exit flag as inconsistent and therefore still slot-blocking. Body,
-    # job identity and lack of worker identity are checked below before this
-    # narrow legacy recovery path may proceed.
+    # Grok's durable reader treats contradictory exit evidence as inconsistent
+    # and therefore still slot-blocking. Body, job identity and lack of worker
+    # identity are checked below before this narrow recovery path may proceed.
     grok_contradictory_exit = provider == "grok" and state == "finished_uncertain"
     if state not in active and not contradictory_exit and not grok_contradictory_exit:
         raise ValueError("job does not hold a slot")
@@ -121,8 +120,13 @@ def _snapshot(con, provider, job_id):
                    "running": {"running"}, "submission_uncertain": {"submission_uncertain"},
                    "not_submitted": {"not_submitted"},
                    "finished_uncertain": {"submission_uncertain"}}
-        if (body.get("status") not in allowed[row[names.index("state")]] or
-            ("local_exit_confirmed" in body and body["local_exit_confirmed"] is not False)):
+        grok_conflicting_exit = (state == "finished_uncertain" and
+                                 body.get("local_exit_confirmed") is True and
+                                 isinstance(body.get("error"), str) and
+                                 body["error"] in _EXIT_UNCONFIRMED)
+        if (body.get("status") not in allowed[state] or
+            ("local_exit_confirmed" in body and body["local_exit_confirmed"] is not False
+             and not grok_conflicting_exit)):
             raise ValueError("contradictory prior result")
     data = [[name, _encoded(value)] for name, value in zip(names, row)]
     payload = json.dumps({"schema": [list(r) for r in info], "row": data},

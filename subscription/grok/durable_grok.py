@@ -35,6 +35,8 @@ else:
 _ACTIVE = ("dispatching", "queued", "running", "submission_uncertain", "not_submitted")
 _PRELAUNCH_ABORTED = "prelaunch_aborted_v1"
 _TERMINAL = ("succeeded", "failed")
+_EXIT_UNCONFIRMED = ("process_exit_unconfirmed", "process_still_running",
+                     "worker_identity_unconfirmed", "operator_released")
 _SCHEMA = """CREATE TABLE IF NOT EXISTS jobs (
     job_id TEXT PRIMARY KEY, task_key TEXT NOT NULL UNIQUE,
     task_digest TEXT NOT NULL, state TEXT NOT NULL,
@@ -141,6 +143,10 @@ class _StoredJob:
     result: object
 
 
+def _confirmed_exit(result: dict) -> bool:
+    return result.get("local_exit_confirmed") is True and result.get("error") not in _EXIT_UNCONFIRMED
+
+
 def _consistent_record(job_id: str, state: str, worker_pid: int | None,
                        worker_identity: str | None, result: object) -> bool:
     """Validate the local state/result pairing before releasing or reporting it.
@@ -164,7 +170,7 @@ def _consistent_record(job_id: str, state: str, worker_pid: int | None,
     if state in ("running", "submission_uncertain"):
         return status == state
     if state == "finished_uncertain":
-        return status == "submission_uncertain" and result.get("local_exit_confirmed") is True
+        return status == "submission_uncertain" and _confirmed_exit(result)
     if state == "operator_released":
         return (status == "submission_uncertain" and result.get("error") == "operator_released"
                 and result.get("release_basis") == "operator_confirmed"
@@ -250,13 +256,26 @@ class _Ledger:
         if (not _valid_id(job_id) or not isinstance(state, dict) or state.get("job_id") != job_id or
                 state.get("status") not in ("queued", "running", "succeeded", "failed", "submission_uncertain")):
             return False
+        # Do not preserve a contradictory claim as a confirmed exit. The
+        # fixed error says the exit was not confirmed even if a buggy producer
+        # also returned True. A false value means "not confirmed" here.
+        if state.get("status") == "submission_uncertain" and state.get("error") in _EXIT_UNCONFIRMED:
+            state = dict(state)
+            if state.get("local_exit_confirmed") is True:
+                state["local_exit_confirmed"] = False
+            if state["error"] == "operator_released":
+                # A worker update cannot establish an operator declaration;
+                # only operator_release() may create one.
+                state.pop("release_basis", None)
+                state["local_exit_confirmed"] = False
+                state["error"] = "process_exit_unconfirmed"
         # Store full results only under user-selected state_root, never stdout.
         text = json.dumps(state, ensure_ascii=True)
         # The remote outcome can remain unknown even after the direct local
         # CLI process exited. Keep the original result/status for polling,
         # but do not reserve a local execution slot for that finished process.
         durable_state = ("finished_uncertain" if state.get("status") == "submission_uncertain"
-                         and state.get("local_exit_confirmed") is True else state["status"])
+                         and _confirmed_exit(state) else state["status"])
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
             row = con.execute("SELECT state,worker_pid,worker_identity,result_json FROM jobs WHERE job_id=?",
@@ -395,8 +414,25 @@ class _Ledger:
                 original = json.loads(row["result_json"])
             except (ValueError, TypeError):
                 return "unsafe_state"
-            if (row["state"] not in ("queued", "running", "submission_uncertain") or
-                not _consistent_record(job_id, row["state"], row["worker_pid"], row["worker_identity"], original)):
+            # Some older/corrupt terminal records are still counted as active:
+            # the stored state says finished, but the body has no evidence of
+            # a confirmed CLI exit. Permit only the narrow, self-consistent
+            # uncertain body below to take the same operator-confirmed path.
+            # A successful/malformed body or a non-boolean exit claim is not
+            # evidence that it is safe to replace the recorded state.
+            uncertain_terminal = (
+                row["state"] == "finished_uncertain" and isinstance(original, dict)
+                and original.get("job_id") == job_id
+                and original.get("status") == "submission_uncertain"
+                and ("local_exit_confirmed" not in original or original["local_exit_confirmed"] is False
+                     or (original["local_exit_confirmed"] is True and original.get("error") in _EXIT_UNCONFIRMED))
+                and "release_basis" not in original
+            )
+            regular_active = (
+                row["state"] in ("queued", "running", "submission_uncertain") and
+                _consistent_record(job_id, row["state"], row["worker_pid"], row["worker_identity"], original)
+            )
+            if not (uncertain_terminal or regular_active):
                 return "unsafe_state"
             observed = self._worker_state(row)
             if observed == "running":
@@ -636,7 +672,15 @@ class DurableGrokAdapter:
         if job.state in {"dispatching", "queued", "running"}:
             if not job.worker_identity or _process_identity(job.worker_pid) != job.worker_identity:
                 return {"status": "submission_uncertain", "job_id": job_id, "error": "worker_identity_unconfirmed"}
-        return dict(job.result)
+        result = dict(job.result)
+        if job.state != "operator_released" and result.get("status") == "submission_uncertain":
+            if result.get("error") in _EXIT_UNCONFIRMED and result.get("local_exit_confirmed") is True:
+                result["local_exit_confirmed"] = False
+            if result.get("error") == "operator_released":
+                result.pop("release_basis", None)
+                result["local_exit_confirmed"] = False
+                result["error"] = "process_exit_unconfirmed"
+        return result
 
     def status(self) -> dict:
         self._flush_known_unstarted()

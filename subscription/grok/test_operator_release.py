@@ -129,6 +129,149 @@ class OperatorReleaseTests(unittest.TestCase):
         self.assertFalse(self.adapter.ledger.store(job_id, {"status":"succeeded", "job_id":job_id, "output":"late"}))
         self.assertEqual(self.adapter.poll(job_id)["output"], "partial answer")
 
+    def test_bound_uncertain_terminal_requires_worker_exit_and_operator_keeps_partial(self):
+        for exit_field in ("missing", False):
+            with self.subTest(exit_field=exit_field), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                cli, profile = root / "cli", root / "profile"
+                cli.touch()
+                profile.mkdir()
+                adapter = subject.DurableGrokAdapter(str(cli), "example-model", "high", str(profile), str(root), 2, 1)
+                task, key = "synthetic task", "original-request"
+                outcome, job_id = adapter.ledger.reserve(key, hashlib.sha256(task.encode()).hexdigest(), 1)
+                self.assertEqual(outcome, "reserved")
+                result = {"status": "submission_uncertain", "job_id": job_id, "output": "partial answer"}
+                if exit_field is False:
+                    result["local_exit_confirmed"] = False
+                with closing(sqlite3.connect(root / "grok-jobs.sqlite3")) as con, con:
+                    con.execute("UPDATE jobs SET state='finished_uncertain', worker_pid=42, worker_identity=?, result_json=? WHERE job_id=?",
+                                ("42:123", json.dumps(result), job_id))
+                self.assertEqual(adapter.status()["local_available_slots"], 0)
+                for observation, expected in (("running", "worker_running"), ("unknown", "identity_unconfirmed")):
+                    with mock.patch.object(subject, "_worker_identity_state", return_value=observation):
+                        self.assertEqual(subject.operator_release(str(root), job_id), expected)
+                    self.assertEqual(adapter.status()["local_available_slots"], 0)
+                with mock.patch.object(subject, "_worker_identity_state", return_value="exited"):
+                    self.assertEqual(subject.operator_release(str(root), job_id), "released")
+                actual = adapter.poll(job_id)
+                self.assertEqual(actual["output"], "partial answer")
+                self.assertEqual(actual["release_basis"], "operator_confirmed")
+                self.assertIs(actual["local_exit_confirmed"], False)
+                self.assertEqual(adapter.status()["local_available_slots"], 1)
+                with mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("must not spawn")):
+                    replay = adapter.submit(task, key)
+                self.assertEqual(replay, {"status": "submission_uncertain", "job_id": job_id, "replayed": True})
+
+    def test_bound_uncertain_terminal_rejects_corrupt_and_contradictory_bodies(self):
+        bodies = [
+            {"status": "succeeded", "output": "finished"},
+            {"status": "submission_uncertain", "local_exit_confirmed": "true"},
+            {"status": "submission_uncertain", "local_exit_confirmed": 1},
+            {"status": "submission_uncertain", "local_exit_confirmed": None},
+            {"status": "submission_uncertain", "release_basis": "operator_confirmed"},
+            {"status": "submission_uncertain", "job_id": str(uuid.uuid4())},
+        ]
+        for body in bodies:
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                ledger = subject._Ledger(root)
+                outcome, job_id = ledger.reserve("key", "digest", 1)
+                self.assertEqual(outcome, "reserved")
+                body = {"job_id": job_id, **body}
+                encoded = json.dumps(body)
+                with closing(sqlite3.connect(root / "grok-jobs.sqlite3")) as con, con:
+                    con.execute("UPDATE jobs SET state='finished_uncertain', worker_pid=42, worker_identity=?, result_json=? WHERE job_id=?",
+                                ("42:123", encoded, job_id))
+                with mock.patch.object(subject, "_worker_identity_state", return_value="exited"):
+                    self.assertEqual(ledger.operator_release(job_id), "unsafe_state")
+                with closing(sqlite3.connect(root / "grok-jobs.sqlite3")) as con:
+                    self.assertEqual(con.execute("SELECT state, result_json FROM jobs WHERE job_id=?", (job_id,)).fetchone(),
+                                     ("finished_uncertain", encoded))
+
+    def test_exit_error_with_true_never_establishes_finished_state(self):
+        for index, error in enumerate(subject._EXIT_UNCONFIRMED):
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                ledger = subject._Ledger(root)
+                _, job_id = ledger.reserve("key", "digest", 1)
+                result = {"status": "submission_uncertain", "job_id": job_id,
+                          "error": error, "local_exit_confirmed": True,
+                          "release_basis": "operator_confirmed", "output": "partial"}
+                self.assertTrue(ledger.store(job_id, result))
+                job = ledger.get(job_id)
+                self.assertEqual(job.state, "submission_uncertain")
+                self.assertIs(job.result["local_exit_confirmed"], False)
+                self.assertEqual(job.result["output"], "partial")
+                self.assertEqual(ledger.capacity(), 1)
+                if error == "operator_released":
+                    self.assertNotIn("release_basis", job.result)
+                    self.assertEqual(job.result["error"], "process_exit_unconfirmed")
+
+                # Preexisting inconsistent terminal rows remain blocking; the
+                # explicit True must not be used by manual recovery.
+                with closing(sqlite3.connect(root / "grok-jobs.sqlite3")) as con, con:
+                    con.execute("UPDATE jobs SET state='finished_uncertain',worker_pid=42,worker_identity=?,result_json=? WHERE job_id=?",
+                                ("42:123", json.dumps(result), job_id))
+                self.assertEqual(ledger.capacity(), 1)
+                with mock.patch.object(subject, "_worker_identity_state", return_value="exited"):
+                    self.assertEqual(ledger.operator_release(job_id), "unsafe_state")
+                self.assertEqual(ledger.capacity(), 1)
+
+    def test_unambiguous_confirmed_exit_does_not_block(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = subject._Ledger(Path(tmp).resolve())
+            _, job_id = ledger.reserve("key", "digest", 1)
+            result = {"status": "submission_uncertain", "job_id": job_id,
+                      "error": "result_unavailable", "local_exit_confirmed": True}
+            self.assertTrue(ledger.store(job_id, result))
+            self.assertEqual(ledger.get(job_id).state, "finished_uncertain")
+            self.assertEqual(ledger.capacity(), 0)
+            self.assertEqual(ledger.operator_release(job_id), "not_blocking")
+
+    def test_bound_conflicting_true_exit_requires_observed_worker_exit(self):
+        for error in subject._EXIT_UNCONFIRMED:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                ledger = subject._Ledger(root)
+                _, job_id = ledger.reserve("key", "digest", 1)
+                result = {"status": "submission_uncertain", "job_id": job_id,
+                          "error": error, "local_exit_confirmed": True, "output": "partial"}
+                with closing(sqlite3.connect(root / "grok-jobs.sqlite3")) as con, con:
+                    con.execute("UPDATE jobs SET state='finished_uncertain',worker_pid=42,worker_identity=?,result_json=? WHERE job_id=?",
+                                ("42:123", json.dumps(result), job_id))
+                self.assertEqual(ledger.capacity(), 1)
+                for observation, expected in (("running", "worker_running"), ("unknown", "identity_unconfirmed")):
+                    with mock.patch.object(subject, "_worker_identity_state", return_value=observation):
+                        self.assertEqual(ledger.operator_release(job_id), expected)
+                with mock.patch.object(subject, "_worker_identity_state", return_value="exited"):
+                    self.assertEqual(ledger.operator_release(job_id), "released")
+                actual = ledger.get(job_id).result
+                self.assertIs(actual["local_exit_confirmed"], False)
+                self.assertEqual(actual["release_basis"], "operator_confirmed")
+                self.assertEqual(actual["output"], "partial")
+                self.assertEqual(ledger.capacity(), 0)
+
+    def test_old_active_conflicting_exit_and_operator_claim_are_not_reported_as_confirmed(self):
+        for error in subject._EXIT_UNCONFIRMED:
+            with self.subTest(error=error), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                cli, profile = root / "cli", root / "profile"
+                cli.touch()
+                profile.mkdir()
+                adapter = subject.DurableGrokAdapter(str(cli), "example-model", "high", str(profile), str(root), 2, 1)
+                _, job_id = adapter.ledger.reserve("key", "digest", 1)
+                original = {"status": "submission_uncertain", "job_id": job_id, "error": error,
+                            "local_exit_confirmed": True, "release_basis": "operator_confirmed"}
+                with closing(sqlite3.connect(root / "grok-jobs.sqlite3")) as con, con:
+                    con.execute("UPDATE jobs SET state='submission_uncertain',result_json=? WHERE job_id=?",
+                                (json.dumps(original), job_id))
+                result = adapter.poll(job_id)
+                self.assertIs(result["local_exit_confirmed"], False)
+                if error == "operator_released":
+                    self.assertNotIn("release_basis", result)
+                    self.assertEqual(result["error"], "process_exit_unconfirmed")
+                self.assertEqual(adapter.status()["local_available_slots"], 0)
+
     def test_listing_existing_ledger_does_not_create_job_directory(self):
         root = Path(self.temp.name).resolve() / "list-only"
         root.mkdir()

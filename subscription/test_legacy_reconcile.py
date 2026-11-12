@@ -204,11 +204,18 @@ class LegacyRecoveryTests(unittest.TestCase):
             with mock.patch.object(lr.sqlite3, "connect", side_effect=AssertionError("must not open")):
                 with self.assertRaises(ValueError):
                     lr.prepare("claude", indirect, self.job, self.ticket)
+                with self.assertRaises(ValueError):
+                    lr.prepare("claude", db, self.job, junction / "nested" / "ticket.json")
             lr.prepare("claude", db, self.job, self.ticket)
             self.uptime.return_value = 50000
             with mock.patch.object(lr.sqlite3, "connect", side_effect=AssertionError("must not open")):
                 with self.assertRaises(ValueError):
                     lr.release(indirect, self.ticket, same_machine_local=True, stopped_dispatchers=True,
+                               full_restart=True, cli_exited=True, updated_only=True)
+                indirect_ticket = junction / "nested" / "ticket.json"
+                shutil.copyfile(self.ticket, real / "nested" / "ticket.json")
+                with self.assertRaises(ValueError):
+                    lr.release(db, indirect_ticket, same_machine_local=True, stopped_dispatchers=True,
                                full_restart=True, cli_exited=True, updated_only=True)
             with closing(sqlite3.connect(db)) as con:
                 self.assertEqual(con.execute("SELECT status FROM jobs WHERE id=?", (self.job,)).fetchone()[0], "reserved")
@@ -242,12 +249,13 @@ class LegacyRecoveryTests(unittest.TestCase):
                         "state TEXT, worker_pid INTEGER, worker_identity TEXT, result_json TEXT)")
             con.execute("INSERT INTO jobs VALUES (?,?,?,'submission_uncertain',NULL,NULL,'{}')",
                         (job, "key", "digest"))
-        for value in ("true", 1, None):
-            with self.subTest(value=value):
+        for state, value in ((state, value) for state in ("submission_uncertain", "finished_uncertain")
+                             for value in ("true", 1, None)):
+            with self.subTest(state=state, value=value):
                 body = json.dumps({"status": "submission_uncertain", "job_id": job,
-                                   "local_exit_confirmed": value})
+                                   "local_exit_confirmed": value, "error": "process_still_running"})
                 with closing(sqlite3.connect(self.db)) as con, con:
-                    con.execute("UPDATE jobs SET result_json=?", (body,))
+                    con.execute("UPDATE jobs SET state=?,result_json=?", (state, body))
                 with self.assertRaises(ValueError):
                     lr.prepare("grok", self.db, job, self.ticket)
                 self.assertFalse(self.ticket.exists())
@@ -257,8 +265,9 @@ class LegacyRecoveryTests(unittest.TestCase):
         cli, profile = self.root / "grok-cli", self.root / "profile"
         cli.touch()
         profile.mkdir()
-        for index, flag in enumerate(("missing", False)):
-            with self.subTest(exit_flag=flag):
+        cases = [("missing", None), (False, None)] + [(True, error) for error in sorted(lr._EXIT_UNCONFIRMED)]
+        for index, (flag, error) in enumerate(cases):
+            with self.subTest(exit_flag=flag, error=error):
                 state_root = self.root / ("grok-state-" + str(index))
                 state_root.mkdir()
                 adapter = durable.DurableGrokAdapter(str(cli), "synthetic-model", "high", str(profile),
@@ -267,8 +276,10 @@ class LegacyRecoveryTests(unittest.TestCase):
                 outcome, job_id = adapter.ledger.reserve(task_id, hashlib.sha256(task.encode()).hexdigest(), 1)
                 self.assertEqual(outcome, "reserved")
                 body = {"status": "submission_uncertain", "job_id": job_id, "output": "partial"}
-                if flag is False:
-                    body["local_exit_confirmed"] = False
+                if flag != "missing":
+                    body["local_exit_confirmed"] = flag
+                if error is not None:
+                    body["error"] = error
                 db, ticket = state_root / "grok-jobs.sqlite3", state_root / "ticket.json"
                 with closing(sqlite3.connect(db)) as con, con:
                     con.execute("UPDATE jobs SET state='finished_uncertain',result_json=? WHERE job_id=?",
@@ -284,6 +295,11 @@ class LegacyRecoveryTests(unittest.TestCase):
                 self.assertEqual(result["status"], "submission_uncertain")
                 self.assertFalse(result["local_exit_confirmed"])
                 self.assertEqual(result["output"], "partial")
+                with closing(sqlite3.connect(db)) as con:
+                    audit = json.loads(con.execute("SELECT prior_control FROM legacy_reconcile_audit").fetchone()[0])
+                if flag is True:
+                    self.assertTrue(audit["local_exit_confirmed"])
+                    self.assertEqual(audit["error"], error)
                 with mock.patch.object(durable.subprocess, "Popen", side_effect=AssertionError("must not spawn")):
                     replay = adapter.submit(task, task_id)
                 self.assertEqual(replay, {"status": "submission_uncertain", "job_id": job_id, "replayed": True})
@@ -297,6 +313,8 @@ class LegacyRecoveryTests(unittest.TestCase):
             con.execute("INSERT INTO jobs VALUES (?,?,?,'finished_uncertain',NULL,NULL,'{}')",
                         (job, "key", "digest"))
         cases = [json.dumps({"status": "submission_uncertain", "job_id": job, "local_exit_confirmed": True}),
+                 json.dumps({"status": "submission_uncertain", "job_id": job, "local_exit_confirmed": True, "error": "other"}),
+                 json.dumps({"status": "submission_uncertain", "job_id": job, "local_exit_confirmed": True, "error": []}),
                  json.dumps({"status": "succeeded", "job_id": job}),
                  json.dumps({"status": "submission_uncertain", "job_id": str(uuid.uuid4())}), "{broken"]
         for body in cases:
@@ -306,6 +324,20 @@ class LegacyRecoveryTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     lr.prepare("grok", self.db, job, self.ticket)
                 self.assertFalse(self.ticket.exists())
+
+    def test_grok_nonterminal_true_even_with_conflicting_error_is_rejected(self):
+        self.db.unlink()
+        job = str(uuid.uuid4())
+        body = {"status": "submission_uncertain", "job_id": job,
+                "local_exit_confirmed": True, "error": "process_still_running"}
+        with closing(sqlite3.connect(self.db)) as con, con:
+            con.execute("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, task_key TEXT UNIQUE, task_digest TEXT, "
+                        "state TEXT, worker_pid INTEGER, worker_identity TEXT, result_json TEXT)")
+            con.execute("INSERT INTO jobs VALUES (?,?,?,'submission_uncertain',NULL,NULL,?)",
+                        (job, "key", "digest", json.dumps(body)))
+        with self.assertRaises(ValueError):
+            lr.prepare("grok", self.db, job, self.ticket)
+        self.assertFalse(self.ticket.exists())
 
     def test_released_claude_replay_never_spawns_and_new_task_gets_slot(self):
         from claude import durable_claude as durable
