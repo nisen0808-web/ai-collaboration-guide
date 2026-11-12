@@ -3,8 +3,12 @@ import json
 import hashlib
 from contextlib import closing, redirect_stderr
 import io
+import os
 from pathlib import Path
+import shutil
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -182,6 +186,35 @@ class LegacyRecoveryTests(unittest.TestCase):
             self.release()
         self.assertEqual(self.rows()[0][2], "reserved")
 
+    @unittest.skipUnless(os.name == "nt", "Windows junction test")
+    def test_windows_nested_junction_refuses_prepare_and_release(self):
+        real = self.root / "real"
+        state = real / "nested" / "state"
+        state.mkdir(parents=True)
+        db = state / "jobs.sqlite3"
+        shutil.copyfile(self.db, db)
+        junction = self.root / "junction"
+        result = subprocess.run(["cmd.exe", "/c", "mklink", "/J", str(junction), str(real)],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, check=False, shell=False)
+        if result.returncode:
+            self.skipTest("Windows could not create synthetic junction")
+        try:
+            indirect = junction / "nested" / "state" / "jobs.sqlite3"
+            with mock.patch.object(lr.sqlite3, "connect", side_effect=AssertionError("must not open")):
+                with self.assertRaises(ValueError):
+                    lr.prepare("claude", indirect, self.job, self.ticket)
+            lr.prepare("claude", db, self.job, self.ticket)
+            self.uptime.return_value = 50000
+            with mock.patch.object(lr.sqlite3, "connect", side_effect=AssertionError("must not open")):
+                with self.assertRaises(ValueError):
+                    lr.release(indirect, self.ticket, same_machine_local=True, stopped_dispatchers=True,
+                               full_restart=True, cli_exited=True, updated_only=True)
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(con.execute("SELECT status FROM jobs WHERE id=?", (self.job,)).fetchone()[0], "reserved")
+        finally:
+            os.rmdir(junction)
+
     def test_generated_column_is_not_accepted(self):
         with closing(sqlite3.connect(self.db)) as con, con:
             con.execute("ALTER TABLE jobs ADD COLUMN generated TEXT GENERATED ALWAYS AS (status) VIRTUAL")
@@ -213,6 +246,61 @@ class LegacyRecoveryTests(unittest.TestCase):
             with self.subTest(value=value):
                 body = json.dumps({"status": "submission_uncertain", "job_id": job,
                                    "local_exit_confirmed": value})
+                with closing(sqlite3.connect(self.db)) as con, con:
+                    con.execute("UPDATE jobs SET result_json=?", (body,))
+                with self.assertRaises(ValueError):
+                    lr.prepare("grok", self.db, job, self.ticket)
+                self.assertFalse(self.ticket.exists())
+
+    def test_contradictory_grok_terminal_recovers_without_replaying_request(self):
+        from grok import durable_grok as durable
+        cli, profile = self.root / "grok-cli", self.root / "profile"
+        cli.touch()
+        profile.mkdir()
+        for index, flag in enumerate(("missing", False)):
+            with self.subTest(exit_flag=flag):
+                state_root = self.root / ("grok-state-" + str(index))
+                state_root.mkdir()
+                adapter = durable.DurableGrokAdapter(str(cli), "synthetic-model", "high", str(profile),
+                                                     str(state_root), max_concurrency=1)
+                task, task_id = "synthetic task", "old-request"
+                outcome, job_id = adapter.ledger.reserve(task_id, hashlib.sha256(task.encode()).hexdigest(), 1)
+                self.assertEqual(outcome, "reserved")
+                body = {"status": "submission_uncertain", "job_id": job_id, "output": "partial"}
+                if flag is False:
+                    body["local_exit_confirmed"] = False
+                db, ticket = state_root / "grok-jobs.sqlite3", state_root / "ticket.json"
+                with closing(sqlite3.connect(db)) as con, con:
+                    con.execute("UPDATE jobs SET state='finished_uncertain',result_json=? WHERE job_id=?",
+                                (json.dumps(body), job_id))
+                self.assertEqual(adapter.status()["local_available_slots"], 0)
+                self.uptime.return_value = 100000
+                lr.prepare("grok", db, job_id, ticket)
+                self.uptime.return_value = 50000
+                lr.release(db, ticket, same_machine_local=True, stopped_dispatchers=True,
+                           full_restart=True, cli_exited=True, updated_only=True)
+                self.assertEqual(adapter.status()["local_available_slots"], 1)
+                result = adapter.poll(job_id)
+                self.assertEqual(result["status"], "submission_uncertain")
+                self.assertFalse(result["local_exit_confirmed"])
+                self.assertEqual(result["output"], "partial")
+                with mock.patch.object(durable.subprocess, "Popen", side_effect=AssertionError("must not spawn")):
+                    replay = adapter.submit(task, task_id)
+                self.assertEqual(replay, {"status": "submission_uncertain", "job_id": job_id, "replayed": True})
+
+    def test_confirmed_or_corrupt_grok_terminal_cannot_be_reconciled(self):
+        self.db.unlink()
+        job = str(uuid.uuid4())
+        with closing(sqlite3.connect(self.db)) as con, con:
+            con.execute("CREATE TABLE jobs (job_id TEXT PRIMARY KEY, task_key TEXT UNIQUE, task_digest TEXT, "
+                        "state TEXT, worker_pid INTEGER, worker_identity TEXT, result_json TEXT)")
+            con.execute("INSERT INTO jobs VALUES (?,?,?,'finished_uncertain',NULL,NULL,'{}')",
+                        (job, "key", "digest"))
+        cases = [json.dumps({"status": "submission_uncertain", "job_id": job, "local_exit_confirmed": True}),
+                 json.dumps({"status": "succeeded", "job_id": job}),
+                 json.dumps({"status": "submission_uncertain", "job_id": str(uuid.uuid4())}), "{broken"]
+        for body in cases:
+            with self.subTest(body=body):
                 with closing(sqlite3.connect(self.db)) as con, con:
                     con.execute("UPDATE jobs SET result_json=?", (body,))
                 with self.assertRaises(ValueError):
@@ -331,6 +419,17 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.assertIn("do not retry automatically", message)
         self.assertNotIn("nothing changed", message)
         self.assertNotIn("private", message)
+
+
+class UptimeSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt" or sys.platform.startswith("linux"), "unsupported platform")
+    def test_real_local_uptime_is_positive_and_nondecreasing(self):
+        # Read-only check of the real platform API. No reboot is attempted or proved.
+        first = lr._uptime_ms()
+        second = lr._uptime_ms()
+        self.assertIs(type(first), int)
+        self.assertGreater(first, 0)
+        self.assertGreaterEqual(second, first)
 
 
 if __name__ == "__main__":

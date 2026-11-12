@@ -99,7 +99,12 @@ def _snapshot(con, provider, job_id):
     state = row[names.index(state_key)]
     contradictory_exit = (provider == "claude" and state == "finished_uncertain"
                           and row[names.index("error")] in _EXIT_UNCONFIRMED)
-    if state not in active and not contradictory_exit:
+    # Grok's durable reader treats a finished state whose body lacks a strict
+    # true exit flag as inconsistent and therefore still slot-blocking. Body,
+    # job identity and lack of worker identity are checked below before this
+    # narrow legacy recovery path may proceed.
+    grok_contradictory_exit = provider == "grok" and state == "finished_uncertain"
+    if state not in active and not contradictory_exit and not grok_contradictory_exit:
         raise ValueError("job does not hold a slot")
     if provider == "claude":
         claims = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_claims'").fetchone()
@@ -114,7 +119,8 @@ def _snapshot(con, provider, job_id):
         allowed = {"dispatching": {"submission_uncertain"},
                    "queued": {"queued", "submission_uncertain"},
                    "running": {"running"}, "submission_uncertain": {"submission_uncertain"},
-                   "not_submitted": {"not_submitted"}}
+                   "not_submitted": {"not_submitted"},
+                   "finished_uncertain": {"submission_uncertain"}}
         if (body.get("status") not in allowed[row[names.index("state")]] or
             ("local_exit_confirmed" in body and body["local_exit_confirmed"] is not False)):
             raise ValueError("contradictory prior result")
