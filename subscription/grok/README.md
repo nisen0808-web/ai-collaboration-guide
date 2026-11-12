@@ -55,7 +55,8 @@ signed attestation of server execution.
 The answer is saved before evidence is read; a later poll can retrieve updated
 evidence, and missing or unsafe evidence leaves the answer usable but unverified.
 If the final result cannot be committed to the local ledger, the adapter keeps
-the task's output file for reconciliation; it cannot promise all local copies
+the task's output file for manual reconciliation; there is no automatic recovery
+of that uncommitted result. It cannot promise all local copies
 are removed. Protect the tool-owned state directory. This check does not
 automatically retry the task. It never reads conversation
 files or deletes session data; the official client may itself persist prompts,

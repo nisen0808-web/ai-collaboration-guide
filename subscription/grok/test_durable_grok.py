@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -41,6 +42,23 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(env.get("HTTPS_PROXY"), synthetic["HTTPS_PROXY"])
         self.assertEqual(env.get("NODE_EXTRA_CA_CERTS"), synthetic["NODE_EXTRA_CA_CERTS"])
         self.assertNotIn("XAI_API_KEY", env)
+
+    def test_detached_worker_disables_bytecode_writes(self):
+        command = subject._worker_command(self.root, "synthetic-job")
+        self.assertEqual(command[1], "-B")
+        self.assertEqual(command[-2:], [str(self.root), "synthetic-job"])
+
+    def test_real_worker_command_does_not_create_bytecode(self):
+        source_dir = Path(subject.__file__).resolve().parent
+        isolated_dir = self.base / "isolated-source"
+        isolated_dir.mkdir()
+        for source in source_dir.glob("*.py"):
+            shutil.copyfile(source, isolated_dir / source.name)
+        with mock.patch.object(subject, "__file__", str(isolated_dir / "durable_grok.py")):
+            command = subject._worker_command(self.root, "not-a-job")
+        completed = subprocess.run(command, capture_output=True, timeout=20, check=False)
+        self.assertEqual(completed.returncode, 2)
+        self.assertEqual(list(isolated_dir.rglob("__pycache__")), [])
 
     def test_worker_omits_invalid_synthetic_network_value(self):
         with mock.patch.object(subject.os, "environ", {"HTTPS_PROXY": "invalid\0value"}):
@@ -433,7 +451,9 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(state["output"], "synthetic answer")
         self.assertEqual(state["quality_verification"]["client_evidence_status"], "unavailable")
         self.assertNotIn("synthetic evidence failure", repr(state))
-        self.assertEqual(adapter.submit("synthetic task", "evidence-order")["reason"], "already_submitted")
+        with mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("must not relaunch")) as duplicate:
+            self.assertEqual(adapter.submit("synthetic task", "evidence-order")["reason"], "already_submitted")
+        duplicate.assert_not_called()
         self.assertEqual(launch.call_count, 1)
 
     def test_store_checks_job_and_never_overwrites_terminal_result(self):
@@ -540,7 +560,9 @@ class DurableTests(unittest.TestCase):
                 self.assertEqual(len(retained), 1)
                 self.assertEqual(retained[0].read_bytes(), b"synthetic answer")
                 self.assertNotEqual(adapter.poll(job_id)["status"], "succeeded")
-                replay = adapter.submit("synthetic task", "key-" + mode)
+                with mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("must not relaunch")) as duplicate:
+                    replay = adapter.submit("synthetic task", "key-" + mode)
+                duplicate.assert_not_called()
                 self.assertEqual(replay["job_id"], job_id)
                 self.assertTrue(replay["replayed"])
                 self.assertEqual(launch.call_count, 1)
@@ -586,7 +608,9 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(state["status"], "succeeded")
         self.assertEqual(state["output"], "synthetic answer")
         self.assertEqual(state["quality_verification"]["client_evidence_status"], "pending")
-        self.assertEqual(adapter.submit("synthetic task", "evidence-commit-failure")["reason"], "already_submitted")
+        with mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("must not relaunch")) as duplicate:
+            self.assertEqual(adapter.submit("synthetic task", "evidence-commit-failure")["reason"], "already_submitted")
+        duplicate.assert_not_called()
         self.assertEqual(launch.call_count, 1)
 
     def test_worker_survives_actual_launcher_exit_then_new_adapter_polls(self):

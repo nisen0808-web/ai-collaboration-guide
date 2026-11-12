@@ -346,7 +346,7 @@ class _Ledger:
 
 
 def _worker_command(root: Path, job_id: str) -> list[str]:
-    return [sys.executable, str(Path(__file__).resolve()), "--worker", str(root), job_id]
+    return [sys.executable, "-B", str(Path(__file__).resolve()), "--worker", str(root), job_id]
 
 
 def _worker_env() -> dict[str, str]:
