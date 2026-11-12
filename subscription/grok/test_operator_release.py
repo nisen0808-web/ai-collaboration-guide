@@ -89,6 +89,23 @@ class OperatorReleaseTests(unittest.TestCase):
         self.assertEqual((result["status"], result["reason"]), ("submission_uncertain", "worker_start_unconfirmed"))
         self.assertIn("worker_start_unconfirmed", SUBMIT_REASONS)
 
+    def test_invalid_spawn_arguments_are_uncertain_and_never_retried(self):
+        for exception in (ValueError("private value"), TypeError("private type")):
+            with self.subTest(exception=type(exception).__name__), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                cli, profile = root / "cli", root / "profile"
+                cli.touch()
+                profile.mkdir()
+                adapter = subject.DurableGrokAdapter(str(cli), "example-model", "high", str(profile), str(root), 2, 1)
+                with mock.patch.object(subject.subprocess, "Popen", side_effect=exception) as spawn:
+                    first = adapter.submit("synthetic task", "stable-key")
+                    second = adapter.submit("synthetic task", "stable-key")
+                self.assertEqual(first["status"], "submission_uncertain")
+                self.assertEqual(first["reason"], "worker_start_unconfirmed")
+                self.assertEqual(second["status"], "submission_uncertain")
+                self.assertEqual(spawn.call_count, 1)
+                self.assertNotIn("private", repr(first) + repr(second))
+
     def test_legacy_not_submitted_row_cannot_be_safely_released(self):
         job_id = self.insert("not_submitted", "not_submitted")
         self.assertEqual(subject.operator_release(str(self.root), job_id), "unsafe_state")

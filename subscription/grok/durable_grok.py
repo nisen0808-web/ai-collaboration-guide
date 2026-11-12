@@ -611,7 +611,7 @@ class DurableGrokAdapter:
             options["start_new_session"] = True
         try:
             subprocess.Popen(_worker_command(self.ledger.root, job_id), **options)
-        except OSError:
+        except (OSError, ValueError, TypeError):
             # The process-creation result is ambiguous. Preserve the record and
             # original request; never auto-spawn a replacement.
             try:
