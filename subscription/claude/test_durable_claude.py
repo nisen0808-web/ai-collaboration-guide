@@ -1,7 +1,7 @@
 """Offline durable-job checks; fake local Python child, no Claude or network."""
 import json
 import hashlib
-from contextlib import closing
+from contextlib import closing, contextmanager
 import io
 import os
 from pathlib import Path
@@ -9,9 +9,10 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 import durable_claude as durable
@@ -28,7 +29,7 @@ class DurableTests(unittest.TestCase):
         for p in (self.state, self.profile, self.work):
             p.mkdir()
         self.cli = root / "synthetic-cli"
-        self.args = (str(self.cli), str(self.profile), str(self.work), str(self.state), "model-example", "medium")
+        self.args = (str(self.cli), str(self.profile), str(self.work), str(self.state), "claude-synthetic", "medium")
 
     def adapter(self, **kwargs):
         return durable.DurableClaudeAdapter(*self.args, enabled=True, **kwargs)
@@ -91,7 +92,7 @@ class DurableTests(unittest.TestCase):
 
     def test_replay_reports_original_state_without_starting_again(self):
         a = self.adapter()
-        fingerprint = hashlib.sha256(json.dumps(["synthetic task", "model-example", "medium"],
+        fingerprint = hashlib.sha256(json.dumps(["synthetic task", "claude-synthetic", "medium"],
                                                 ensure_ascii=True).encode("ascii")).hexdigest()
         with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
             with con:
@@ -127,12 +128,328 @@ class DurableTests(unittest.TestCase):
             self.assertEqual(a.submit("other", "other")["reason"], "provider_busy")
         self.assertEqual(spawn.call_count, 1)
 
+    def test_spawn_error_cannot_overwrite_a_concurrent_terminal_result(self):
+        a = self.adapter()
+        def spawn(*_args, **_kwargs):
+            with durable._connect(a.db) as con:
+                con.execute("UPDATE jobs SET status='succeeded',output_file=? WHERE id=?",
+                            ("spawn-race.result.json", "spawn-race"))
+            raise OSError("synthetic")
+        with patch("durable_claude.subprocess.Popen", side_effect=spawn):
+            receipt = a.submit("task", "spawn-race")
+        self.assertEqual(receipt["status"], "submission_uncertain")
+        with durable._connect(a.db) as con:
+            row = con.execute("SELECT status,output_file FROM jobs WHERE id='spawn-race'").fetchone()
+        self.assertEqual(row["status"], "succeeded")
+        self.assertEqual(row["output_file"], "spawn-race.result.json")
+
+    def test_opt_in_intent_is_frozen_and_replay_survives_mode_change(self):
+        a = self.adapter(session_evidence=True)
+        class Input:
+            def write(self, data): self.value = data
+            def close(self): pass
+        class Process:
+            stdin = Input()
+            def wait(self): pass
+        with patch("durable_claude.subprocess.Popen", return_value=Process()) as popen:
+            self.assertEqual(a.submit("synthetic prompt", "opt-in")["status"], "queued")
+        message = json.loads(Process.stdin.value)
+        self.assertTrue(message["session_evidence"])
+        with durable._connect(a.db) as con:
+            row = con.execute("SELECT session_id FROM session_evidence_intents WHERE job_id=?", ("opt-in",)).fetchone()
+        self.assertEqual(row[0], message["session_id"])
+        b = self.adapter(session_evidence=False)
+        with patch("durable_claude.subprocess.Popen", side_effect=AssertionError("must not restart")):
+            replay = b.submit("synthetic prompt", "opt-in")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["job_id"], "opt-in")
+        self.assertEqual(popen.call_count, 1)
+        self.assertNotIn("session_id", replay)
+        self.assertNotIn(b"synthetic prompt", (self.state / "jobs.sqlite3").read_bytes())
+
+    def test_opt_in_uuid_failure_does_not_reserve_or_launch(self):
+        a = self.adapter(session_evidence=True, max_concurrency=1)
+        fake_uuid = SimpleNamespace(uuid4=Mock(side_effect=OSError("synthetic-private")))
+        with patch("durable_claude.uuid", fake_uuid), \
+             patch("durable_claude.subprocess.Popen", side_effect=AssertionError("must not launch")) as popen:
+            receipt = a.submit("synthetic task", "new-job")
+        self.assertEqual(receipt, {"status": "not_submitted", "reason": "session_evidence_unavailable"})
+        self.assertEqual(a.status()["local_active"], 0)
+        with durable._connect(a.db) as con:
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+            self.assertEqual(con.execute("SELECT COUNT(*) FROM session_evidence_intents").fetchone()[0], 0)
+        popen.assert_not_called()
+        self.assertNotIn("synthetic-private", repr(receipt))
+
+    def test_opt_in_existing_or_busy_job_never_generates_uuid(self):
+        a = self.adapter(session_evidence=True, max_concurrency=1)
+        fingerprint = hashlib.sha256(json.dumps(["synthetic task", "claude-synthetic", "medium"],
+                                               ensure_ascii=True).encode("ascii")).hexdigest()
+        with durable._connect(a.db) as con:
+            con.execute("INSERT INTO jobs VALUES (?,?,'submission_uncertain',NULL,NULL,NULL)", ("old-job", fingerprint))
+        fake_uuid = SimpleNamespace(uuid4=Mock(side_effect=OSError("synthetic-private")))
+        with patch("durable_claude.uuid", fake_uuid), \
+             patch("durable_claude.subprocess.Popen", side_effect=AssertionError("must not launch")):
+            replay = a.submit("synthetic task", "old-job")
+            busy = a.submit("other", "new-job")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["status"], "submission_uncertain")
+        self.assertEqual(replay["job_id"], "old-job")
+        self.assertEqual(busy, {"status": "not_submitted", "reason": "provider_busy"})
+        fake_uuid.uuid4.assert_not_called()
+
+    def test_opt_in_worker_retains_only_safe_session_projection(self):
+        a = self.adapter(session_evidence=True)
+        self.insert("session-job", "reserved")
+        session_id = "319d322a-a582-459c-abd0-e2d7676cad1b"
+        with durable._connect(a.db) as con:
+            con.execute("INSERT INTO session_evidence_intents VALUES (?,?,NULL)", ("session-job", session_id))
+        message = {"task": "synthetic prompt", "cli_path": str(self.cli), "profile_dir": str(self.profile),
+                   "work_dir": str(self.work), "model": "claude-synthetic", "effort": "medium",
+                   "timeout_seconds": 900, "session_evidence": True, "session_id": session_id}
+        class FakeAdapter:
+            def __init__(self, *_args, **_kwargs): pass
+            def submit(self, task, task_id, **kwargs):
+                assert kwargs["_session_id"] == session_id
+                return {"status": "queued", "job_id": task_id}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "local_exit_confirmed": True,
+                        "session_bound": True}
+        def collect(*args, **kwargs):
+            with durable._connect(a.db) as con:
+                row = con.execute("SELECT status,output_file FROM jobs WHERE id='session-job'").fetchone()
+                pending = json.loads(con.execute("SELECT quality_json FROM session_evidence_intents WHERE job_id='session-job'").fetchone()[0])
+            self.assertEqual(row["status"], "succeeded")
+            self.assertEqual(json.loads((self.state / row["output_file"]).read_text(encoding="utf-8"))["output"], "ok")
+            self.assertEqual(pending["session_cleanup"], "unconfirmed")
+            self.assertEqual(pending["client_evidence_status"], "pending")
+            self.assertIs(kwargs["durable_result_saved"], True)
+            return {"client_evidence_status": "matched", "client_model_matches_requested": True,
+                    "client_effort_matches_requested": True, "session_cleanup": "deletion_requested",
+                    "private": "synthetic-private"}
+        fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
+        with patch("durable_claude.ClaudeAdapter", FakeAdapter), patch("durable_claude.sys.stdin", fake_stdin), \
+             patch("session_evidence.collect_session_evidence", side_effect=collect) as collector:
+            durable._run_worker(str(self.state), "session-job")
+        collector.assert_called_once()
+        result = a.poll("session-job")
+        self.assertTrue(result["quality_verification"]["client_effort_matches_requested"])
+        self.assertEqual(result["quality_verification"]["session_cleanup"], "deletion_requested")
+        self.assertFalse(result["quality_verification"]["effort_verified"])
+        self.assertNotIn(session_id, repr(result))
+        self.assertNotIn("synthetic-private", repr(result))
+
+    def test_opt_in_failed_worker_preserves_cleanup_status_without_raw_evidence(self):
+        a = self.adapter(session_evidence=True)
+        self.insert("failed-session", "reserved")
+        session_id = "319d322a-a582-459c-abd0-e2d7676cad1b"
+        with durable._connect(a.db) as con:
+            con.execute("INSERT INTO session_evidence_intents VALUES (?,?,NULL)", ("failed-session", session_id))
+        message = {"task": "synthetic prompt", "cli_path": str(self.cli), "profile_dir": str(self.profile),
+                   "work_dir": str(self.work), "model": "claude-synthetic", "effort": "medium",
+                   "timeout_seconds": 900, "session_evidence": True, "session_id": session_id}
+        class FakeAdapter:
+            def __init__(self, *_args, **_kwargs): pass
+            def submit(self, task, task_id, **kwargs): return {"status": "queued", "job_id": task_id}
+            def poll(self, job_id):
+                return {"status": "failed", "error": "provider_reported_error", "session_quality": {
+                    "client_evidence_status": "unavailable", "client_model_matches_requested": None,
+                    "client_effort_matches_requested": None, "session_cleanup": "not_attempted",
+                    "private": "synthetic-private"}}
+        fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
+        with patch("durable_claude.ClaudeAdapter", FakeAdapter), patch("durable_claude.sys.stdin", fake_stdin):
+            durable._run_worker(str(self.state), "failed-session")
+        result = a.poll("failed-session")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["quality_verification"]["session_cleanup"], "not_attempted")
+        self.assertIsNone(result["quality_verification"]["client_effort_matches_requested"])
+        self.assertNotIn(session_id, repr(result))
+        self.assertNotIn("synthetic-private", repr(result))
+
+    def _run_session_persistence_case(self, fault):
+        a = self.adapter(session_evidence=True)
+        self.insert("boundary-job", "reserved")
+        session_id = "319d322a-a582-459c-abd0-e2d7676cad1b"
+        with durable._connect(a.db) as con:
+            con.execute("INSERT INTO session_evidence_intents VALUES (?,?,NULL)", ("boundary-job", session_id))
+            if fault in ("pending-fail", "final-fail"):
+                target = "unconfirmed" if fault == "pending-fail" else "deletion_requested"
+                con.execute("CREATE TRIGGER inject_failure BEFORE UPDATE ON session_evidence_intents "
+                            "WHEN NEW.quality_json LIKE '%" + target + "%' "
+                            "BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+        message = {"task": "synthetic prompt", "cli_path": str(self.cli), "profile_dir": str(self.profile),
+                   "work_dir": str(self.work), "model": "claude-synthetic", "effort": "medium",
+                   "timeout_seconds": 900, "session_evidence": True, "session_id": session_id}
+        class FakeAdapter:
+            def __init__(self, *_args, **_kwargs): pass
+            def submit(self, task, task_id, **kwargs): return {"status": "queued", "job_id": task_id}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "recoverable response",
+                        "local_exit_confirmed": True, "session_bound": True}
+        def collected(*_args, **kwargs):
+            self.assertIs(kwargs["durable_result_saved"], True)
+            if fault == "collector-fail":
+                raise OSError("synthetic-private")
+            return {"client_evidence_status": "matched", "client_model_matches_requested": True,
+                    "client_effort_matches_requested": True, "session_cleanup": "deletion_requested"}
+        original_atomic = durable._atomic_json
+        def write_result(path, value):
+            if fault == "write-fail":
+                raise OSError("synthetic-private")
+            original_atomic(path, value)
+            if fault == "crash-after-write":
+                raise OSError("synthetic crash")
+            if fault == "terminal-race":
+                with durable._connect(a.db) as con:
+                    con.execute("UPDATE jobs SET status='failed',error='provider_reported_error' WHERE id='boundary-job'")
+        fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
+        with patch("durable_claude.ClaudeAdapter", FakeAdapter), patch("durable_claude.sys.stdin", fake_stdin), \
+             patch("durable_claude._atomic_json", side_effect=write_result), \
+             patch("session_evidence.collect_session_evidence", side_effect=collected) as collector:
+            durable._run_worker(str(self.state), "boundary-job")
+        return a, a.poll("boundary-job"), collector.call_count
+
+    def test_result_write_failures_never_collect_or_delete_session(self):
+        for fault in ("write-fail", "crash-after-write"):
+            with self.subTest(fault=fault):
+                # Each case needs independent ledger/trigger state.
+                nested = DurableTests("runTest")
+                nested.setUp()
+                try:
+                    a, result, calls = nested._run_session_persistence_case(fault)
+                    self.assertEqual(result["status"], "submission_uncertain")
+                    self.assertEqual(result["quality_verification"]["session_cleanup"], "not_attempted")
+                    self.assertNotIn("output", result)
+                    self.assertEqual(calls, 0)
+                    self.assertEqual((nested.state / "boundary-job.result.json").exists(), fault == "crash-after-write")
+                    self.assertNotIn("synthetic-private", repr(result))
+                finally:
+                    nested.doCleanups()
+
+    def test_cleanup_marker_failure_rolls_back_terminal_commit_and_does_not_collect(self):
+        a, result, calls = self._run_session_persistence_case("pending-fail")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertNotIn("output", result)
+        self.assertTrue((self.state / "boundary-job.result.json").exists())
+        self.assertEqual(result["quality_verification"]["session_cleanup"], "not_attempted")
+        self.assertEqual(calls, 0)
+
+    def test_collection_crash_or_final_state_write_failure_stays_unconfirmed(self):
+        for fault in ("collector-fail", "final-fail"):
+            with self.subTest(fault=fault):
+                nested = DurableTests("runTest")
+                nested.setUp()
+                try:
+                    a, result, calls = nested._run_session_persistence_case(fault)
+                    self.assertEqual(result["status"], "succeeded")
+                    self.assertEqual(result["output"], "recoverable response")
+                    self.assertEqual(result["quality_verification"]["session_cleanup"], "unconfirmed")
+                    self.assertIsNone(result["quality_verification"]["client_effort_matches_requested"])
+                    self.assertEqual(calls, 1)
+                    self.assertNotIn("synthetic-private", repr(result))
+                finally:
+                    nested.doCleanups()
+
+    def test_concurrent_terminal_prevents_late_success_and_cleanup(self):
+        a, result, calls = self._run_session_persistence_case("terminal-race")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "provider_reported_error")
+        self.assertEqual(calls, 0)
+        self.assertTrue((self.state / "boundary-job.result.json").exists())
+
+    def test_unexpected_exception_after_success_commit_cannot_erase_result(self):
+        original_connect = durable._connect
+        injected = [False]
+        @contextmanager
+        def injected_connect(db):
+            committed_success = [False]
+            with original_connect(db) as con:
+                class Connection:
+                    def execute(self, sql, params=()):
+                        if "UPDATE jobs SET status='succeeded'" in sql:
+                            committed_success[0] = True
+                        return con.execute(sql, params)
+                yield Connection()
+            if committed_success[0] and not injected[0]:
+                injected[0] = True
+                raise RuntimeError("synthetic after commit")
+        with patch("durable_claude._connect", side_effect=injected_connect):
+            a, result, calls = self._run_session_persistence_case("none")
+        self.assertTrue(injected[0])
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["output"], "recoverable response")
+        self.assertEqual(result["quality_verification"]["client_evidence_status"], "pending")
+        self.assertEqual(result["quality_verification"]["session_cleanup"], "unconfirmed")
+        self.assertEqual(calls, 0)
+
+    def test_unexpected_quality_write_exception_cannot_erase_result(self):
+        original_connect = durable._connect
+        @contextmanager
+        def injected_connect(db):
+            with original_connect(db) as con:
+                class Connection:
+                    def execute(self, sql, params=()):
+                        if ("UPDATE session_evidence_intents SET quality_json" in sql and params
+                                and isinstance(params[0], str) and '"deletion_requested"' in params[0]):
+                            raise RuntimeError("synthetic-private")
+                        return con.execute(sql, params)
+                yield Connection()
+        with patch("durable_claude._connect", side_effect=injected_connect):
+            a, result, calls = self._run_session_persistence_case("none")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["output"], "recoverable response")
+        self.assertEqual(result["quality_verification"]["client_evidence_status"], "pending")
+        self.assertEqual(result["quality_verification"]["session_cleanup"], "unconfirmed")
+        self.assertEqual(calls, 1)
+        self.assertNotIn("synthetic-private", repr(result))
+
+    def test_result_is_available_while_client_evidence_is_pending(self):
+        a = self.adapter(session_evidence=True)
+        self.insert("pending-job", "reserved")
+        session_id = "319d322a-a582-459c-abd0-e2d7676cad1b"
+        with durable._connect(a.db) as con:
+            con.execute("INSERT INTO session_evidence_intents VALUES (?,?,NULL)", ("pending-job", session_id))
+        message = {"task": "synthetic prompt", "cli_path": str(self.cli), "profile_dir": str(self.profile),
+                   "work_dir": str(self.work), "model": "claude-synthetic", "effort": "medium",
+                   "timeout_seconds": 900, "session_evidence": True, "session_id": session_id}
+        class FakeAdapter:
+            def __init__(self, *_args, **_kwargs): pass
+            def submit(self, task, task_id, **kwargs): return {"status": "queued", "job_id": task_id}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ready response",
+                        "local_exit_confirmed": True, "session_bound": True}
+        entered, release = threading.Event(), threading.Event()
+        def collect(*_args, **_kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("synthetic timeout")
+            return {"client_evidence_status": "matched", "client_model_matches_requested": True,
+                    "client_effort_matches_requested": True, "session_cleanup": "deletion_requested"}
+        fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
+        with patch("durable_claude.ClaudeAdapter", FakeAdapter), patch("durable_claude.sys.stdin", fake_stdin), \
+             patch("session_evidence.collect_session_evidence", side_effect=collect) as collector:
+            thread = threading.Thread(target=durable._run_worker, args=(str(self.state), "pending-job"))
+            try:
+                thread.start()
+                self.assertTrue(entered.wait(3))
+                pending = a.poll("pending-job")
+                self.assertEqual(pending["status"], "succeeded")
+                self.assertEqual(pending["output"], "ready response")
+                self.assertEqual(pending["quality_verification"]["client_evidence_status"], "pending")
+                self.assertEqual(pending["quality_verification"]["session_cleanup"], "unconfirmed")
+            finally:
+                release.set()
+                thread.join(3)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(collector.call_count, 1)
+        self.assertEqual(a.poll("pending-job")["quality_verification"]["client_evidence_status"], "matched")
+
     def test_real_worker_writes_final_result_after_synthetic_slow_poll(self):
         a = self.adapter()
         self.insert("worker-job", "reserved")
         message = {"task": "synthetic prompt", "cli_path": str(self.cli),
                    "profile_dir": str(self.profile), "work_dir": str(self.work),
-                   "model": "model-example", "effort": "medium", "timeout_seconds": 900}
+                   "model": "claude-synthetic", "effort": "medium", "timeout_seconds": 900}
         class FakeAdapter:
             def __init__(self, *_args, **_kwargs):
                 self.events = iter([{"status": "running"},

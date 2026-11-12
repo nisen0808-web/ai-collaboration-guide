@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from contextlib import closing
 from pathlib import Path
@@ -359,6 +360,51 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         self.assertFalse(c.status()["providers"]["claude"]["ready"])
         self.assertEqual(c.status()["providers"]["claude"]["verification"], "not_verified")
 
+    def test_status_preserves_unconfigured_adapter_without_claiming_login(self):
+        class Disabled:
+            def status(self):
+                return {"configured": False, "ready": False}
+        status = Coordinator(self.db, {"claude": Disabled()}).status()["providers"]["claude"]
+        self.assertIs(status["configured"], False)
+        self.assertIs(status["ready"], False)
+        self.assertNotIn("loggedIn", status)
+        self.assertEqual(status["verification"], "not_verified")
+
+    def test_trusted_disabled_status_survives_a_blocked_probe(self):
+        entered, release = threading.Event(), threading.Event()
+        class Disabled:
+            def status(self):
+                entered.set()
+                release.wait(3)
+                return {"configured": True, "ready": True, "loggedIn": True}
+        class Grok:
+            def status(self):
+                return {"ready": True}
+        c = Coordinator(self.db, {"claude": Disabled(), "grok": Grok()},
+                        status_timeout=0.1, unconfigured_providers=("claude",))
+        try:
+            for _ in range(2):
+                providers = c.status()["providers"]
+                self.assertTrue(entered.is_set())
+                self.assertIs(providers["claude"]["configured"], False)
+                self.assertIs(providers["claude"]["ready"], False)
+                self.assertNotIn("loggedIn", providers["claude"])
+                self.assertEqual(providers["claude"]["verification"], "not_verified")
+                self.assertIs(providers["grok"]["ready"], True)
+            release.set()
+            # An inconsistent late adapter observation cannot override the
+            # startup fact or claim authentication on the disabled entry.
+            for _ in range(20):
+                providers = c.status()["providers"]
+                if providers["claude"].get("reported_by_adapter"):
+                    break
+                time.sleep(0.01)
+            self.assertIs(providers["claude"]["configured"], False)
+            self.assertIs(providers["claude"]["ready"], False)
+            self.assertNotIn("loggedIn", providers["claude"])
+        finally:
+            release.set()
+
     def test_status_one_provider_hang_does_not_block_other(self):
         entered, release = threading.Event(), threading.Event()
         class Claude:
@@ -493,6 +539,34 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         finally:
             sys.path.remove(package_root)
 
+    def test_claude_durable_uuid_failure_is_known_unsubmitted_at_coordinator(self):
+        package_root = str(Path(__file__).resolve().parents[1])
+        sys.path.insert(0, package_root)
+        try:
+            from claude import durable_claude
+            root = Path(self.tmp.name)
+            state, profile, work, cli = (root / name for name in ("uuid-state", "uuid-profile", "uuid-work", "uuid-cli"))
+            for directory in (state, profile, work):
+                directory.mkdir()
+            adapter = durable_claude.DurableClaudeAdapter(str(cli), str(profile), str(work), str(state),
+                "claude-synthetic", "medium", enabled=True, session_evidence=True)
+            coordinator = Coordinator(self.db, {"claude": adapter})
+            with patch.object(durable_claude, "uuid") as fake_uuid, \
+                 patch.object(durable_claude.subprocess, "Popen", side_effect=AssertionError("must not launch")) as popen:
+                fake_uuid.uuid4.side_effect = OSError("synthetic-private")
+                receipt = coordinator.submit("claude", "task", "uuid-key")
+            self.assertEqual(receipt["status"], "not_submitted")
+            self.assertEqual(receipt["reason"], "session_evidence_unavailable")
+            self.assertEqual(coordinator.get("uuid-key")["status"], "not_submitted")
+            self.assertIsNone(receipt["job_id"])
+            self.assertNotIn("synthetic-private", repr(receipt))
+            with durable_claude._connect(adapter.db) as con:
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0], 0)
+                self.assertEqual(con.execute("SELECT COUNT(*) FROM session_evidence_intents").fetchone()[0], 0)
+            popen.assert_not_called()
+        finally:
+            sys.path.remove(package_root)
+
     def test_claude_adapter_cannot_claim_effort_or_overall_verification(self):
         class Adapter:
             def submit(self, **kwargs): return {"status": "queued", "job_id": "job"}
@@ -526,6 +600,80 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         self.assertIsNone(quality["model_usage_matches_requested"])
         self.assertEqual(quality["evidence_source"], "not_verified")
         self.assertNotIn("synthetic-private", repr(quality))
+
+    def test_session_quality_is_narrow_and_never_server_verification(self):
+        class Adapter:
+            def submit(self, **kwargs): return {"status": "queued", "job_id": "job"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                    "verified": True, "effort_verified": True, "server_effort_verified": True,
+                    "client_evidence_status": "matched", "session_cleanup": "deletion_requested",
+                    "client_model_matches_requested": True, "client_effort_matches_requested": True,
+                    "path": "synthetic-private", "record": "synthetic-private"}}
+        c = Coordinator(self.db, {"claude": Adapter()})
+        c.submit("claude", "task", "session-quality")
+        quality = c.result("claude", "session-quality")["quality_verification"]
+        self.assertTrue(quality["client_effort_matches_requested"])
+        self.assertFalse(quality["verified"])
+        self.assertFalse(quality["effort_verified"])
+        self.assertFalse(quality["server_effort_verified"])
+        self.assertNotIn("synthetic-private", repr(quality))
+
+    def test_model_usage_and_client_evidence_are_both_preserved(self):
+        class Adapter:
+            def submit(self, **kwargs): return {"status": "queued", "job_id": "job"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                    "verified": False, "model_usage_matches_requested": True,
+                    "recorded_model": "claude-synthetic-1", "evidence_source": "cli_result_model_usage",
+                    "client_evidence_status": "matched", "session_cleanup": "deletion_requested",
+                    "client_model_matches_requested": True, "client_effort_matches_requested": True}}
+        c = Coordinator(self.db, {"claude": Adapter()})
+        c.submit("claude", "task", "both-quality-fields")
+        quality = c.result("claude", "both-quality-fields")["quality_verification"]
+        self.assertIs(quality["model_usage_matches_requested"], True)
+        self.assertEqual(quality["recorded_model"], "claude-synthetic-1")
+        self.assertEqual(quality["evidence_source"], "cli_result_model_usage")
+        self.assertEqual(quality["client_evidence_status"], "matched")
+        self.assertIs(quality["client_model_matches_requested"], True)
+        self.assertIs(quality["client_effort_matches_requested"], True)
+        self.assertIs(quality["verified"], False)
+        self.assertIs(quality["server_effort_verified"], False)
+
+    def test_inconsistent_session_match_is_not_forwarded_as_verified(self):
+        class Adapter:
+            def submit(self, **kwargs): return {"status": "queued", "job_id": "job"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                    "client_evidence_status": "matched", "session_cleanup": "deletion_requested",
+                    "client_model_matches_requested": True, "client_effort_matches_requested": None}}
+        c = Coordinator(self.db, {"claude": Adapter()})
+        c.submit("claude", "task", "invalid-session-quality")
+        quality = c.result("claude", "invalid-session-quality")["quality_verification"]
+        self.assertEqual(quality["client_evidence_status"], "unavailable")
+        self.assertIsNone(quality["client_model_matches_requested"])
+        self.assertIsNone(quality["client_effort_matches_requested"])
+        self.assertEqual(quality["session_cleanup"], "deletion_requested")
+
+    def test_pending_session_evidence_does_not_block_answer_or_resubmit(self):
+        class Adapter:
+            def __init__(self): self.calls = 0
+            def submit(self, **kwargs):
+                self.calls += 1
+                return {"status": "queued", "job_id": "job"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "ready", "quality_verification": {
+                    "client_evidence_status": "pending", "session_cleanup": "unconfirmed",
+                    "client_model_matches_requested": None, "client_effort_matches_requested": None}}
+        adapter = Adapter()
+        c = Coordinator(self.db, {"claude": adapter})
+        c.submit("claude", "task", "pending-key")
+        result = c.result("claude", "pending-key")
+        self.assertEqual(result["output"], "ready")
+        self.assertEqual(result["quality_verification"]["client_evidence_status"], "pending")
+        self.assertEqual(c.result("claude", "pending-key")["quality_verification"]["session_cleanup"], "unconfirmed")
+        self.assertTrue(c.submit("claude", "task", "pending-key")["replayed"])
+        self.assertEqual(adapter.calls, 1)
 
     def test_uncertain_with_job_id_can_be_queried_without_resubmission(self):
         class Adapter:

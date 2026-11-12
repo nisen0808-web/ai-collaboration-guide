@@ -15,8 +15,9 @@ sys.path.insert(0, str(ROOT / "core"))
 from coordinator import Coordinator  # noqa: E402
 from mcp_stdio import serve  # noqa: E402
 from claude.durable_claude import DurableClaudeAdapter as ClaudeAdapter  # noqa: E402
+from claude.readonly_ledger import ReadOnlyClaudeLedger  # noqa: E402
 from grok.durable_grok import DurableGrokAdapter as GrokAdapter  # noqa: E402
-from claude.claude_adapter import ClaudeAdapter as ClaudeLoginAdapter  # noqa: E402
+from claude.claude_adapter import ClaudeAdapter as ClaudeLoginAdapter, valid_session_evidence_model  # noqa: E402
 from grok.grok_adapter import GrokAdapter as GrokLoginAdapter  # noqa: E402
 
 
@@ -48,8 +49,11 @@ def build_adapters(args: argparse.Namespace) -> dict:
     data = Path(args.data_dir).expanduser().resolve()
     data.mkdir(parents=True, exist_ok=True, mode=0o700)
     adapters = {}
+    invalid_claude = args.claude_session_evidence and not valid_session_evidence_model(args.claude_model)
+    if invalid_claude:
+        adapters["claude"] = ReadOnlyClaudeLedger(data / "claude-jobs")
     try:
-        claude_cli = executable(args.claude_cli)
+        claude_cli = None if invalid_claude else executable(args.claude_cli)
         if claude_cli:
             profile = (Path(args.claude_profile).expanduser().resolve()
                        if args.claude_profile else data / "claude-profile")
@@ -61,6 +65,7 @@ def build_adapters(args: argparse.Namespace) -> dict:
             adapters["claude"] = ClaudeAdapter(
                 claude_cli, str(profile), str(work), str(state), args.claude_model,
                 args.claude_effort, enabled=True, timeout_seconds=args.timeout,
+                session_evidence=args.claude_session_evidence,
             )
     except Exception:
         # One unavailable provider, including a broken local database, must
@@ -119,6 +124,8 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("--claude-model", default="sonnet", help="Model or official Claude alias")
     common.add_argument("--grok-model", default="grok-build", help="Model supported by your Grok account")
     common.add_argument("--claude-effort", default="medium", help="Claude thinking level")
+    common.add_argument("--claude-session-evidence", action="store_true",
+                        help="Explicit Windows-only opt-in: the official client may store task text and answers in a private session; cleanup is not guaranteed")
     common.add_argument("--grok-effort", default="medium", help="Grok thinking level")
     common.add_argument("--timeout", type=int, default=600, help="Seconds before a slow task is marked uncertain")
     common.add_argument("--codex-cli", default="codex", help="Codex executable for installation")
@@ -135,6 +142,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     if not 30 <= args.timeout <= 900:
         parser().error("--timeout must be between 30 and 900 seconds")
+    invalid_claude = args.claude_session_evidence and not valid_session_evidence_model(args.claude_model)
+    if args.mode == "install" and invalid_claude:
+        print("Claude session evidence requires an explicit full claude-* model ID; bare aliases are not supported.", file=sys.stderr)
+        return 1
+    if args.mode == "serve" and invalid_claude:
+        print("Claude session evidence requires an explicit full claude-* model ID; new Claude tasks are disabled.", file=sys.stderr)
     try:
         if args.mode == "install":
             codex_cli = executable(args.codex_cli)
@@ -170,6 +183,8 @@ def main(argv: list[str] | None = None) -> int:
                        "--claude-model", args.claude_model, "--grok-model", args.grok_model,
                        "--claude-effort", args.claude_effort, "--grok-effort", args.grok_effort,
                        "--timeout", str(args.timeout)]
+            if args.claude_session_evidence:
+                command.append("--claude-session-evidence")
             for flag, value in (("--claude-profile", claude_profile), ("--grok-profile", grok_profile)):
                 if value:
                     command.extend((flag, value))
@@ -206,7 +221,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if ok else 1
         adapters = build_adapters(args)
         data = Path(args.data_dir).expanduser().resolve()
-        core = Coordinator(data / "requests.sqlite3", adapters=adapters)
+        # The read-only Claude ledger exists solely to query old tasks. This
+        # startup fact must survive an unavailable or locked status probe.
+        core = Coordinator(data / "requests.sqlite3", adapters=adapters,
+                           unconfigured_providers=("claude",) if invalid_claude else ())
         for stream in (sys.stdin, sys.stdout):
             if hasattr(stream, "reconfigure"):
                 stream.reconfigure(encoding="utf-8", errors="strict")

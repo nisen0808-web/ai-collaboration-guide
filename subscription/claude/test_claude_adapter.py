@@ -22,7 +22,7 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.cli = str(base / "claude-fake")
         self.profile = str(base / "profile")
         self.work = str(base / "work")
-        self.options = (self.cli, self.profile, self.work, "model-example", "medium")
+        self.options = (self.cli, self.profile, self.work, "claude-synthetic", "medium")
         self.auth = SimpleNamespace(returncode=0, stdout=json.dumps({"loggedIn": True,
             "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"}))
         self.ok = SimpleNamespace(returncode=0, stdout=json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": "synthetic response"}))
@@ -66,6 +66,13 @@ class ClaudeAdapterTests(unittest.TestCase):
              patch("claude_adapter.subprocess.Popen", side_effect=AssertionError("launched")):
             self.assertEqual(adapter.submit("task", "id1")["status"], "not_submitted")
 
+    def test_session_evidence_requires_explicit_claude_model_id(self):
+        for model in ("sonnet", "opus", "model-example", "claude-", "claude-invalid/path"):
+            with self.subTest(model=model), self.assertRaises(ValueError):
+                ClaudeAdapter(self.cli, self.profile, self.work, model, "medium", session_evidence=True)
+        ClaudeAdapter(self.cli, self.profile, self.work, "claude-synthetic", "medium", session_evidence=True)
+        ClaudeAdapter(self.cli, self.profile, self.work, "sonnet", "medium", session_evidence=False)
+
     def test_status_reports_unknown_readiness_without_invoking_cli(self):
         for enabled in (False, True):
             adapter = ClaudeAdapter(*self.options, enabled=enabled)
@@ -107,6 +114,109 @@ class ClaudeAdapterTests(unittest.TestCase):
         self.assertEqual(generate.args[0][generate.args[0].index("--tools") + 1], "")
         self.assertIn("--no-session-persistence", generate.args[0])
         self.assertNotIn("--bare", generate.args[0])
+
+    def test_in_memory_session_is_bound_but_never_collected_or_deleted(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, session_evidence=True)
+        safe = {"client_evidence_status": "matched", "client_model_matches_requested": True,
+                "client_effort_matches_requested": True, "session_cleanup": "deletion_requested",
+                "synthetic-private": "synthetic-private"}
+        def start(command, **kwargs):
+            session = command[command.index("--session-id") + 1]
+            process = Mock(returncode=0)
+            process.communicate.return_value = (json.dumps({"type": "result", "subtype": "success",
+                "is_error": False, "result": "ok", "session_id": session}), "")
+            return process
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", side_effect=start) as popen, \
+             patch("session_evidence.prepare_session_evidence", return_value=True) as prepare, \
+             patch("session_evidence.collect_session_evidence", return_value=safe) as collect:
+            adapter.submit("task", "session-job")
+            result = self.wait_job(adapter, "session-job")
+        self.assertEqual(result["status"], "succeeded")
+        quality = result["quality_verification"]
+        self.assertIsNone(quality["client_model_matches_requested"])
+        self.assertIsNone(quality["client_effort_matches_requested"])
+        self.assertEqual(quality["session_cleanup"], "not_attempted")
+        self.assertTrue(result["session_bound"])
+        self.assertFalse(quality["verified"])
+        self.assertFalse(quality["effort_verified"])
+        command = popen.call_args.args[0]
+        self.assertNotIn("--no-session-persistence", command)
+        session = command[command.index("--session-id") + 1]
+        self.assertEqual(prepare.call_args.args[2], session)
+        collect.assert_not_called()
+        self.assertNotIn(session, repr(result))
+        self.assertNotIn("synthetic-private", repr(result))
+
+    def test_opt_in_unavailable_preflight_never_sends_request(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, session_evidence=True)
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", side_effect=AssertionError("must not send")) as popen, \
+             patch("session_evidence.prepare_session_evidence", return_value=False):
+            adapter.submit("task", "unavailable")
+            result = self.wait_job(adapter, "unavailable")
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["error"], "session_evidence_unavailable")
+        popen.assert_not_called()
+
+    def test_session_id_generation_failure_does_not_reserve_or_launch(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, max_concurrency=1, session_evidence=True)
+        with patch("claude_adapter.uuid.uuid4", side_effect=OSError("synthetic-private")), \
+             patch.object(threading.Thread, "start", side_effect=AssertionError("must not start")) as start, \
+             patch("claude_adapter.subprocess.Popen", side_effect=AssertionError("must not send")) as popen:
+            result = adapter.submit("task", "uuid-failure")
+        self.assertEqual(result, {"status": "not_submitted", "reason": "session_evidence_unavailable"})
+        self.assertEqual(adapter.status()["local_active"], 0)
+        self.assertEqual(adapter.poll("uuid-failure"), {"status": "submission_uncertain", "error": "unknown_job"})
+        start.assert_not_called()
+        popen.assert_not_called()
+        self.assertNotIn("synthetic-private", repr(result))
+
+    def test_opt_in_session_mismatch_never_reads_or_deletes_session(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, session_evidence=True)
+        process = Mock(returncode=0)
+        process.communicate.return_value = (json.dumps({"type": "result", "subtype": "success",
+            "is_error": False, "result": "ok", "session_id": "different"}), "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process), \
+             patch("session_evidence.prepare_session_evidence", return_value=True), \
+             patch("session_evidence.collect_session_evidence", side_effect=AssertionError("must not read")) as collect:
+            adapter.submit("task", "unbound")
+            result = self.wait_job(adapter, "unbound")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertEqual(result["error"], "invalid_provider_response")
+        self.assertNotIn("output", result)
+        self.assertIsNone(result["quality_verification"]["client_model_matches_requested"])
+        self.assertEqual(result["quality_verification"]["session_cleanup"], "not_attempted")
+        collect.assert_not_called()
+
+    def test_opt_in_missing_session_never_delivers_unbound_response(self):
+        adapter = ClaudeAdapter(*self.options, enabled=True, session_evidence=True)
+        process = Mock(returncode=0)
+        process.communicate.return_value = (json.dumps({"type": "result", "subtype": "success",
+            "is_error": False, "result": "synthetic-private"}), "")
+        with patch("claude_adapter.subprocess.run", return_value=self.auth), \
+             patch("claude_adapter.subprocess.Popen", return_value=process), \
+             patch("session_evidence.prepare_session_evidence", return_value=True), \
+             patch("session_evidence.collect_session_evidence", side_effect=AssertionError("must not read")) as collect:
+            adapter.submit("task", "missing-session")
+            result = self.wait_job(adapter, "missing-session")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertNotIn("output", result)
+        self.assertNotIn("synthetic-private", repr(result))
+        collect.assert_not_called()
+
+    def test_invalid_matched_projection_is_unavailable_with_cleanup_preserved(self):
+        from claude_adapter import _stored_session_quality
+        for model, effort in ((True, None), (None, True), (None, None)):
+            with self.subTest(model=model, effort=effort):
+                result = _stored_session_quality({"client_evidence_status": "matched",
+                    "client_model_matches_requested": model, "client_effort_matches_requested": effort,
+                    "session_cleanup": "deletion_requested"})
+                self.assertEqual(result["client_evidence_status"], "unavailable")
+                self.assertIsNone(result["client_model_matches_requested"])
+                self.assertIsNone(result["client_effort_matches_requested"])
+                self.assertEqual(result["session_cleanup"], "deletion_requested")
 
     def test_nonzero_structured_error_is_failed_without_returning_body(self):
         adapter = ClaudeAdapter(*self.options, enabled=True, max_concurrency=1)

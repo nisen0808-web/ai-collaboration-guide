@@ -29,7 +29,8 @@ SUBMIT_REASONS = frozenset({
     "adapter_unavailable", "adapter_error", "login_required", "billing_unverified",
     "provider_busy", "invalid_task", "invalid_task_id", "cli_or_profile_unavailable",
     "task_id_conflict", "worker_unavailable", "already_submitted",
-    "state_unavailable", "state_write_failed", "dispatch_interrupted",
+    "state_unavailable", "state_write_failed", "dispatch_interrupted", "session_evidence_unavailable",
+    "session_evidence_model_invalid",
 })
 POLL_ERRORS = frozenset({
     "login_required", "provider_busy", "provider_error", "adapter_error", "timed_out",
@@ -40,6 +41,7 @@ POLL_ERRORS = frozenset({
     "inspection_unavailable", "unexpected_or_unknown_extensions", "process_still_running",
     "cli_failed", "empty_result", "execution_unverified", "job_state_unavailable",
     "worker_error", "worker_unavailable", "worker_setup_failed", "input_too_large",
+    "session_evidence_unavailable",
     "worker_identity_unconfirmed", "worker_start_unconfirmed",
     "worker_request_invalid", "dispatch_interrupted", "state_write_failed",
 })
@@ -83,10 +85,15 @@ class Coordinator:
     The adapter must not signal not_submitted if it might have sent a request.
     """
 
-    def __init__(self, db_path: str | Path, adapters: dict[str, Any] | None = None, *, status_timeout: float = 1.5):
+    def __init__(self, db_path: str | Path, adapters: dict[str, Any] | None = None, *, status_timeout: float = 1.5,
+                 unconfigured_providers: tuple[str, ...] = ()):
         self.path = str(db_path)
         self.adapters = dict(adapters or {})
         self.status_timeout = max(0.0, min(float(status_timeout), 5.0))
+        # Trusted startup configuration, not a live provider observation.
+        # In particular, a read-only historical ledger must remain visibly
+        # disabled even if its status probe blocks on an existing DB lock.
+        self._unconfigured_providers = frozenset(unconfigured_providers) & {"claude", "grok"}
         self._status_slots = {name: threading.BoundedSemaphore(1) for name in ("claude", "grok")}
         self._initialise()
 
@@ -119,8 +126,8 @@ class Coordinator:
     def status(self) -> dict:
         # Status is separately bounded per provider; a hung provider cannot
         # prevent a different provider or the coordinator from proceeding.
-        values = {name: {"configured": name in self.adapters,
-                         "ready": None if name in self.adapters else False,
+        values = {name: {"configured": name in self.adapters and name not in self._unconfigured_providers,
+                         "ready": None if name in self.adapters and name not in self._unconfigured_providers else False,
                          "verification": "not_verified"}
                   for name in ("claude", "grok")}
         finished = {}
@@ -135,7 +142,9 @@ class Coordinator:
                 try:
                     value = fn()
                     if isinstance(value, dict):
-                        safe = {key: value[key] for key in ("ready", "loggedIn") if type(value.get(key)) is bool}
+                        # Configuration is an adapter observation, not proof
+                        # of authentication, availability, or model execution.
+                        safe = {key: value[key] for key in ("configured", "ready", "loggedIn") if type(value.get(key)) is bool}
                         method = value.get("authMethod")
                         if method in ("oauth", "claude.ai", "subscription", "cached_token", "api_key", "unknown"):
                             safe["authMethod"] = method
@@ -159,6 +168,10 @@ class Coordinator:
         for name, event in finished.items():
             if event.is_set() and name in observations:
                 values[name].update(observations[name])
+            if name in self._unconfigured_providers:
+                values[name]["configured"] = False
+                values[name]["ready"] = False
+                values[name].pop("loggedIn", None)
         return {"providers": values}
 
     def get(self, request_key: str) -> dict:
@@ -364,6 +377,18 @@ class Coordinator:
                 safe["model_usage_matches_requested"] = None
                 # Never pass through an untrusted or contradictory source.
                 safe["evidence_source"] = "not_verified"
+                client_status = quality.get("client_evidence_status")
+                cleanup = quality.get("session_cleanup")
+                if client_status in ("matched", "unavailable", "disabled", "pending") and cleanup in ("deletion_requested", "retained", "not_attempted", "unconfirmed"):
+                    if client_status == "matched" and (quality.get("client_model_matches_requested") is not True
+                                                       or quality.get("client_effort_matches_requested") is not True
+                                                       or cleanup != "deletion_requested"):
+                        client_status = "unavailable"
+                    safe["client_evidence_status"] = client_status
+                    safe["session_cleanup"] = cleanup
+                    for key in ("client_model_matches_requested", "client_effort_matches_requested"):
+                        safe[key] = True if client_status == "matched" and quality.get(key) is True else None
+                    safe["server_effort_verified"] = False
             if provider == "claude" and "model_usage_matches_requested" in quality:
                 model = quality.get("recorded_model")
                 valid_model_evidence = (quality["model_usage_matches_requested"] is True

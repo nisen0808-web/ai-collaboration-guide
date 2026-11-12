@@ -11,6 +11,8 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
+import hashlib
 import unittest
 from unittest.mock import patch
 
@@ -32,6 +34,146 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(grok.call_args.args[1], "test-grok")
             self.assertTrue(Path(tmp, "claude-profile").is_dir())
             self.assertTrue(Path(tmp, "grok-profile").is_dir())
+
+    def test_client_session_evidence_requires_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for flags, expected in (([], False), (["--claude-session-evidence"], True)):
+                args = ai_team.parser().parse_args(["serve", "--data-dir", tmp, "--claude-model", "claude-sonnet-4-5", *flags])
+                with patch.object(ai_team, "executable", side_effect=lambda n: "/synthetic/" + n), \
+                     patch.object(ai_team, "ClaudeAdapter") as claude, patch.object(ai_team, "GrokAdapter"):
+                    ai_team.build_adapters(args)
+                self.assertIs(claude.call_args.kwargs["session_evidence"], expected)
+
+    def test_session_evidence_rejects_alias_before_install(self):
+        for mode in ("install",):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                stderr = io.StringIO()
+                with patch.object(ai_team, "build_adapters", side_effect=AssertionError("must not build")), \
+                     patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not run")), \
+                     redirect_stderr(stderr):
+                    result = ai_team.main([mode, "--data-dir", tmp, "--claude-session-evidence"])
+                self.assertEqual(result, 1)
+                self.assertIn("explicit full claude-* model ID", stderr.getvalue())
+                self.assertNotIn(tmp, stderr.getvalue())
+                self.assertEqual(list(Path(tmp).iterdir()), [])
+
+    def test_invalid_session_model_serves_grok_and_rejects_new_claude(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with patch.object(ai_team, "executable", side_effect=lambda name: "/synthetic/grok" if name == "grok" else None), \
+                 patch.object(ai_team, "ClaudeAdapter", side_effect=AssertionError("no Claude process")), \
+                 patch.object(ai_team, "GrokAdapter") as grok, \
+                 patch.object(ai_team, "serve") as serve, redirect_stderr(stderr):
+                grok.return_value.submit.return_value = {"status": "queued", "job_id": "grokjob"}
+                self.assertEqual(ai_team.main(["serve", "--data-dir", tmp, "--claude-session-evidence"]), 0)
+                core = serve.call_args.args[0]
+                claude = core.submit("claude", "synthetic task", "claude-key")
+                self.assertEqual(claude["status"], "not_submitted")
+                self.assertEqual(claude["reason"], "session_evidence_model_invalid")
+                self.assertEqual(core.submit("grok", "synthetic task", "grok-key")["status"], "queued")
+                grok.return_value.submit.assert_called_once()
+                self.assertFalse(Path(tmp, "claude-jobs", "jobs.sqlite3").exists())
+                self.assertIn("new Claude tasks are disabled", stderr.getvalue())
+
+    def test_invalid_session_model_status_stays_disabled_if_ledger_probe_hangs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entered, release = threading.Event(), threading.Event()
+            def blocked_status():
+                entered.set()
+                release.wait(3)
+                return {"configured": True, "ready": True, "loggedIn": True}
+            with patch.object(ai_team, "executable", side_effect=lambda name: "/synthetic/grok" if name == "grok" else None), \
+                 patch.object(ai_team, "ClaudeAdapter", side_effect=AssertionError("no Claude process")), \
+                 patch.object(ai_team, "GrokAdapter") as grok, patch.object(ai_team, "serve") as serve, \
+                 redirect_stderr(io.StringIO()):
+                grok.return_value.status.return_value = {"ready": True}
+                self.assertEqual(ai_team.main(["serve", "--data-dir", tmp, "--claude-session-evidence"]), 0)
+                core = serve.call_args.args[0]
+                core.status_timeout = 0.1
+                with patch.object(core.adapters["claude"], "status", side_effect=blocked_status):
+                    try:
+                        for _ in range(2):
+                            values = core.status()["providers"]
+                            self.assertTrue(entered.is_set())
+                            self.assertIs(values["claude"]["configured"], False)
+                            self.assertIs(values["claude"]["ready"], False)
+                            self.assertNotIn("loggedIn", values["claude"])
+                            self.assertIs(values["grok"]["ready"], True)
+                    finally:
+                        release.set()
+
+    def test_invalid_session_model_reads_original_ledger_and_wal_without_writing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp, "claude-jobs")
+            state.mkdir()
+            db = state / "jobs.sqlite3"
+            writer = sqlite3.connect(str(db))
+            self.addCleanup(writer.close)
+            writer.execute("PRAGMA journal_mode=WAL")
+            writer.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, status TEXT NOT NULL, error TEXT, heartbeat REAL, output_file TEXT)")
+            writer.commit()
+            writer.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)", ("oldjob", "fingerprint", "running", None, time.time(), None))
+            writer.commit()
+            args = ai_team.parser().parse_args(["serve", "--data-dir", tmp, "--claude-session-evidence"])
+            with patch.object(ai_team, "executable", return_value=None), patch.object(ai_team, "ClaudeAdapter", side_effect=AssertionError("no client")):
+                adapter = ai_team.build_adapters(args)["claude"]
+            self.assertEqual(adapter.find_job("oldjob"), "oldjob")
+            self.assertEqual(adapter.poll("oldjob")["status"], "running")
+            result = state / "oldjob.result.json"
+            result.write_text(json.dumps({"output": "synthetic prior result"}), encoding="utf-8")
+            writer.execute("UPDATE jobs SET status=?, output_file=? WHERE id=?", ("succeeded", result.name, "oldjob"))
+            writer.commit()
+            before = writer.execute("SELECT * FROM jobs").fetchall()
+            self.assertEqual(adapter.poll("oldjob")["output"], "synthetic prior result")
+            self.assertEqual(writer.execute("SELECT * FROM jobs").fetchall(), before)
+            self.assertEqual(adapter.poll("../oldjob")["status"], "submission_uncertain")
+            writer.execute("UPDATE jobs SET output_file=? WHERE id=?", ("../other", "oldjob"))
+            writer.commit()
+            self.assertEqual(adapter.poll("oldjob")["error"], "result_unavailable")
+            writer.close()
+
+    def test_invalid_session_model_missing_or_corrupt_ledger_is_uncertain(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = ai_team.ReadOnlyClaudeLedger(Path(tmp, "claude-jobs"))
+            self.assertEqual(adapter.poll("oldjob")["status"], "submission_uncertain")
+            self.assertIsNone(adapter.find_job("oldjob"))
+            self.assertFalse(adapter.db.exists())
+            adapter.state_dir.mkdir()
+            adapter.db.write_bytes(b"not a sqlite database")
+            before = hashlib.sha256(adapter.db.read_bytes()).digest()
+            self.assertEqual(adapter.poll("oldjob")["error"], "job_state_unavailable")
+            self.assertIsNone(adapter.find_job("oldjob"))
+            self.assertEqual(hashlib.sha256(adapter.db.read_bytes()).digest(), before)
+
+    def test_read_only_ledger_reads_real_durable_adapter_schema(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp, "claude-jobs")
+            state.mkdir()
+            durable = ai_team.ClaudeAdapter(str(Path(tmp, "synthetic-cli")), tmp, tmp,
+                                            str(state), "claude-synthetic-1", "medium", enabled=False)
+            output = state / "oldjob.result.json"
+            model_quality = {"model_usage_matches_requested": True, "recorded_model": "claude-synthetic-1",
+                             "evidence_source": "cli_result_model_usage"}
+            session_quality = {"client_evidence_status": "matched", "session_cleanup": "deletion_requested",
+                               "client_model_matches_requested": True, "client_effort_matches_requested": True}
+            output.write_text(json.dumps({"output": "synthetic result", "quality_verification": model_quality}), encoding="utf-8")
+            db = sqlite3.connect(durable.db)
+            try:
+                with db:
+                    db.execute("INSERT INTO jobs VALUES (?, ?, ?, ?, ?, ?)",
+                               ("oldjob", "synthetic-fingerprint", "succeeded", None, None, output.name))
+                    db.execute("INSERT INTO session_evidence_intents VALUES (?, ?, ?)",
+                               ("oldjob", "synthetic-session", json.dumps(session_quality)))
+            finally:
+                db.close()
+            old = ai_team.ReadOnlyClaudeLedger(state)
+            self.assertEqual(old.find_job("oldjob"), "oldjob")
+            self.assertEqual(old.poll("oldjob")["output"], "synthetic result")
+            self.assertEqual(old.poll("oldjob")["status"], "succeeded")
+            quality = old.poll("oldjob")["quality_verification"]
+            self.assertIs(quality["model_usage_matches_requested"], True)
+            self.assertIs(quality["client_effort_matches_requested"], True)
+            self.assertFalse(old.status()["configured"])
 
     def test_missing_client_leaves_other_available(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import threading
+import uuid
 
 _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\Z")
 _EVIDENCE_MODEL = re.compile(r"claude-[A-Za-z0-9][A-Za-z0-9._-]{0,89}\Z")
@@ -27,6 +28,11 @@ _INHERIT = frozenset({"PATH", "SYSTEMROOT", "WINDIR", "LANG", "LC_ALL", "LC_CTYP
 _CLAUDE_ACCOUNT = frozenset({"claude.ai", "claude_ai", "claudeai", "claude.ai oauth", "claude.ai/oauth"})
 _PLANS = frozenset({"free", "pro", "max", "ultra", "team", "enterprise", "claude_pro", "claude_max",
                     "default_claude_pro", "default_claude_max_5x", "default_claude_max_20x", "max5x", "max20x"})
+
+
+def valid_session_evidence_model(model: object) -> bool:
+    """Require a syntactically explicit Claude ID, not a bare alias."""
+    return isinstance(model, str) and bool(_EVIDENCE_MODEL.fullmatch(model))
 
 
 def _absolute(path) -> str:
@@ -130,6 +136,24 @@ def _stored_model_quality(value: object, requested_model: str | None = None) -> 
             "recorded_model": model, "evidence_source": _MODEL_SOURCE}
 
 
+def _stored_session_quality(value: object) -> dict:
+    """Allow only non-identifying, fixed client-record observations."""
+    unknown = {"client_model_matches_requested": None, "client_effort_matches_requested": None,
+               "client_evidence_status": "unavailable", "session_cleanup": "not_attempted"}
+    if not isinstance(value, dict):
+        return unknown
+    status, cleanup = value.get("client_evidence_status"), value.get("session_cleanup")
+    if status not in ("matched", "unavailable", "disabled", "pending") or cleanup not in ("deletion_requested", "retained", "not_attempted", "unconfirmed"):
+        return unknown
+    if status == "matched" and (value.get("client_model_matches_requested") is not True
+                                or value.get("client_effort_matches_requested") is not True
+                                or cleanup != "deletion_requested"):
+        return {**unknown, "session_cleanup": cleanup}
+    return {"client_model_matches_requested": True if value.get("client_model_matches_requested") is True and status == "matched" else None,
+            "client_effort_matches_requested": True if value.get("client_effort_matches_requested") is True and status == "matched" else None,
+            "client_evidence_status": status, "session_cleanup": cleanup}
+
+
 class ClaudeAdapter:
     """In-process asynchronous text worker; no durable replay after restart.
 
@@ -139,7 +163,7 @@ class ClaudeAdapter:
     the official CLI may access its own login in the selected profile.
     """
     def __init__(self, cli_path, profile_dir, work_dir, model, effort, *, enabled=False,
-                 timeout_seconds=900, max_concurrency=2):
+                 timeout_seconds=900, max_concurrency=2, session_evidence=False):
         self.cli_path = _absolute(cli_path)
         self.profile_dir = _absolute(profile_dir)
         self.work_dir = _absolute(work_dir)
@@ -153,21 +177,32 @@ class ClaudeAdapter:
             raise ValueError("invalid timeout")
         if type(max_concurrency) is not int or not 1 <= max_concurrency <= 8:
             raise ValueError("invalid max_concurrency")
+        if type(session_evidence) is not bool:
+            raise ValueError("session_evidence must be boolean")
+        if session_evidence and not valid_session_evidence_model(model):
+            raise ValueError("session evidence requires an explicit claude-* model ID")
         self.model, self.effort = model, effort
         self.enabled, self.timeout = enabled, timeout_seconds
+        self.session_evidence = session_evidence
         # This is a local safety limit, not a provider quota or plan limit.
         self.max_concurrency = max_concurrency
         self._active = 0
         self._jobs = {}
         self._lock = threading.Lock()
 
-    def submit(self, task: str, task_id: str) -> dict:
+    def submit(self, task: str, task_id: str, *, _session_id: str | None = None) -> dict:
         if not self.enabled:
             return {"status": "not_submitted", "reason": "adapter_unavailable"}
         if not isinstance(task, str) or not task.strip() or len(task) > 100000:
             return {"status": "not_submitted", "reason": "invalid_task"}
         if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
             return {"status": "not_submitted", "reason": "invalid_task_id"}
+        if _session_id is not None:
+            try:
+                if not self.session_evidence or not isinstance(_session_id, str) or str(uuid.UUID(_session_id)) != _session_id:
+                    raise ValueError("invalid session")
+            except ValueError:
+                return {"status": "not_submitted", "reason": "session_evidence_unavailable"}
         digest = hashlib.sha256(task.encode("utf-8")).digest()
         with self._lock:
             if task_id in self._jobs:
@@ -182,8 +217,20 @@ class ClaudeAdapter:
                 return {"status": "submission_uncertain", "job_id": task_id, "replayed": True}
             if self._active >= self.max_concurrency:
                 return {"status": "not_submitted", "reason": "provider_busy"}
+            session_id = None
+            if self.session_evidence:
+                try:
+                    session_id = _session_id or str(uuid.uuid4())
+                except Exception:
+                    # Nothing has been reserved or launched yet.
+                    return {"status": "not_submitted", "reason": "session_evidence_unavailable"}
             self._active += 1
             self._jobs[task_id] = {"status": "queued", "digest": digest}
+            if self.session_evidence:
+                self._jobs[task_id]["_session_id"] = session_id
+                self._jobs[task_id]["session_quality"] = _stored_session_quality(None)
+                self._jobs[task_id]["quality_verification"] = {**_stored_model_quality(None),
+                                                               **_stored_session_quality(None)}
             worker = threading.Thread(target=self._worker, args=(task_id, task), daemon=True)
             try:
                 worker.start()
@@ -215,7 +262,7 @@ class ClaudeAdapter:
             entry = self._jobs.get(job_id)
             if entry is None:
                 return {"status": "submission_uncertain", "error": "unknown_job"}
-            return {key: value for key, value in entry.items() if key != "digest"}
+            return {key: value for key, value in entry.items() if key not in ("digest", "_session_id")}
 
     def status(self) -> dict:
         """Configuration only; this is not evidence of current login or quota."""
@@ -240,7 +287,7 @@ class ClaudeAdapter:
             with self._lock:
                 job = self._jobs[job_id]
                 known_prelaunch_failure = (job.get("status") == "failed" and job.get("error") in
-                                           {"subscription_login_unavailable", "preflight_error"})
+                                           {"subscription_login_unavailable", "preflight_error", "session_evidence_unavailable"})
                 # Never free a slot merely because the local worker stopped:
                 # a child may still exist after a spawn or communicate error.
                 if known_prelaunch_failure or job.get("local_exit_confirmed") is True:
@@ -264,10 +311,26 @@ class ClaudeAdapter:
             self._update(job_id, status="failed", error="preflight_error")
             return
 
+        session = None
+        if self.session_evidence:
+            try:
+                if __package__:
+                    from .session_evidence import prepare_session_evidence
+                else:
+                    from session_evidence import prepare_session_evidence
+                with self._lock:
+                    session = self._jobs[job_id].get("_session_id")
+                if prepare_session_evidence(self.profile_dir, self.work_dir, session, enabled=True) is not True:
+                    raise ValueError("session evidence unavailable")
+            except Exception:
+                self._update(job_id, status="failed", error="session_evidence_unavailable")
+                return
+
         # This is the first potential model submission. Never retry after here.
         command = [self.cli_path, "-p", "--model", self.model, "--effort", self.effort,
-                   "--output-format", "json", "--no-session-persistence", "--tools", "", "--permission-prompts", "none",
+                   "--output-format", "json", "--tools", "", "--permission-prompts", "none",
                    "--setting-sources", "", "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}']
+        command.extend(["--session-id", session] if session else ["--no-session-persistence"])
         process_exit_confirmed = False
         try:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -293,6 +356,14 @@ class ClaudeAdapter:
                 payload = _unambiguous_json(stdout)
             except (TypeError, ValueError):
                 payload = None
+            session_quality = None
+            if session:
+                session_quality = _stored_session_quality(None)
+                # This in-memory adapter cannot durably save the answer. It
+                # never reads or deletes the session. A durable wrapper may
+                # collect evidence only after it has committed the result.
+                self._update(job_id, session_quality=session_quality)
+                self._update(job_id, quality_verification={**_stored_model_quality(None), **session_quality})
             if isinstance(payload, dict) and payload.get("is_error") is True:
                 error_subtypes = {"error_max_turns", "error_during_execution", "error_max_budget_usd",
                                   "error_max_structured_output_retries"}
@@ -315,7 +386,15 @@ class ClaudeAdapter:
                 self._update(job_id, status="submission_uncertain", error="invalid_provider_response",
                              local_exit_confirmed=process_exit_confirmed)
                 return
+            if session and payload.get("session_id") != session:
+                self._update(job_id, status="submission_uncertain", error="invalid_provider_response",
+                             local_exit_confirmed=process_exit_confirmed)
+                return
+            if session:
+                self._update(job_id, session_bound=True)
             quality = _model_quality(payload, self.model)
+            if session_quality is not None:
+                quality.update(session_quality)
             self._update(job_id, status="succeeded", output=payload["result"],
                          model_verification="unverified",
                          effort_verification="unverified", quality_verification=quality,

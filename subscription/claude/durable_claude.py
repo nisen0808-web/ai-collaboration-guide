@@ -18,13 +18,14 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 
 if __package__:
-    from .claude_adapter import ClaudeAdapter, child_environment, _absolute, _stored_model_quality
+    from .claude_adapter import ClaudeAdapter, child_environment, _absolute, _stored_model_quality, _stored_session_quality
 else:
     # Detached execution uses this file as a script; Python then adds its
     # containing directory rather than the package parent to sys.path.
-    from claude_adapter import ClaudeAdapter, child_environment, _absolute, _stored_model_quality
+    from claude_adapter import ClaudeAdapter, child_environment, _absolute, _stored_model_quality, _stored_session_quality
 
 _TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
 _WORKER_SCRIPT = str(Path(__file__).resolve())
@@ -65,7 +66,7 @@ def _atomic_json(path: Path, value: dict) -> None:
 class DurableClaudeAdapter:
     """Locally bounded, detached worker candidate; never retry uncertain jobs."""
     def __init__(self, cli_path, profile_dir, work_dir, state_dir, model, effort,
-                 *, enabled=False, timeout_seconds=900, max_concurrency=2):
+                 *, enabled=False, timeout_seconds=900, max_concurrency=2, session_evidence=False):
         self.cli_path = _absolute(cli_path)
         self.profile_dir = _absolute(profile_dir)
         self.work_dir = _absolute(work_dir)
@@ -81,13 +82,16 @@ class DurableClaudeAdapter:
         # code that eventually starts the CLI, but do not call it here.
         self._adapter = ClaudeAdapter(self.cli_path, self.profile_dir, self.work_dir,
                                       model, effort, enabled=enabled,
-                                      timeout_seconds=timeout_seconds)
+                                      timeout_seconds=timeout_seconds, session_evidence=session_evidence)
         self.model, self.effort, self.enabled = model, effort, enabled
+        self.session_evidence = session_evidence
         self.timeout, self.max_concurrency = timeout_seconds, max_concurrency
         self.db = self.state_dir / "jobs.sqlite3"
         with _connect(self.db) as con:
             con.execute("CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
                         "status TEXT NOT NULL, error TEXT, heartbeat REAL, output_file TEXT)")
+            con.execute("CREATE TABLE IF NOT EXISTS session_evidence_intents (job_id TEXT PRIMARY KEY, "
+                        "session_id TEXT NOT NULL, quality_json TEXT)")
 
     def login(self) -> dict:
         return self._adapter.login()
@@ -126,12 +130,16 @@ class DurableClaudeAdapter:
             return {"status": "not_submitted", "reason": "invalid_task"}
         if not isinstance(task_id, str) or not _TASK_ID.fullmatch(task_id):
             return {"status": "not_submitted", "reason": "invalid_task_id"}
-        fingerprint = hashlib.sha256(json.dumps([task, self.model, self.effort], ensure_ascii=True).encode("ascii")).hexdigest()
+        original_input = [task, self.model, self.effort]
+        legacy_fingerprint = hashlib.sha256(json.dumps(original_input, ensure_ascii=True).encode("ascii")).hexdigest()
+        evidence_fingerprint = hashlib.sha256(json.dumps(original_input + ["client_session_evidence_v1"], ensure_ascii=True).encode("ascii")).hexdigest()
+        fingerprint = evidence_fingerprint if self.session_evidence else legacy_fingerprint
+        session_id = None
         with _connect(self.db) as con:
             con.execute("BEGIN IMMEDIATE")
             old = con.execute("SELECT fingerprint,status,error,heartbeat FROM jobs WHERE id=?", (task_id,)).fetchone()
             if old:
-                if old["fingerprint"] != fingerprint:
+                if old["fingerprint"] not in (legacy_fingerprint, evidence_fingerprint):
                     return {"status": "not_submitted", "reason": "task_id_conflict"}
                 prior = old["status"]
                 if prior in ("queued", "running"):
@@ -151,11 +159,20 @@ class DurableClaudeAdapter:
             active = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchone()[0]
             if active >= self.max_concurrency:
                 return {"status": "not_submitted", "reason": "provider_busy"}
+            if self.session_evidence:
+                try:
+                    session_id = str(uuid.uuid4())
+                except Exception:
+                    # The transaction has not reserved or launched anything.
+                    return {"status": "not_submitted", "reason": "session_evidence_unavailable"}
             con.execute("INSERT INTO jobs VALUES (?,?,'reserved',NULL,NULL,NULL)", (task_id, fingerprint))
+            if session_id:
+                con.execute("INSERT INTO session_evidence_intents VALUES (?,?,NULL)", (task_id, session_id))
 
         payload = json.dumps({"task": task, "cli_path": self.cli_path, "profile_dir": self.profile_dir,
                               "work_dir": self.work_dir, "model": self.model, "effort": self.effort,
-                              "timeout_seconds": self.timeout}, ensure_ascii=True).encode("ascii")
+                              "timeout_seconds": self.timeout, "session_evidence": self.session_evidence,
+                              "session_id": session_id}, ensure_ascii=True).encode("ascii")
         if len(payload) > _MAX_INPUT_BYTES:
             # No worker or provider has been started yet.
             self._set(task_id, "failed", "input_too_large")
@@ -180,7 +197,7 @@ class DurableClaudeAdapter:
             # A spawn error alone is not a durable proof that no worker was
             # created. Preserve the ID and slot until an operator reconciles.
             try:
-                self._set(task_id, "submission_uncertain", "worker_unavailable")
+                self._set_if_reserved(task_id, "submission_uncertain", "worker_unavailable")
             except Exception:
                 pass
             return {"status": "submission_uncertain", "job_id": task_id,
@@ -221,20 +238,33 @@ class DurableClaudeAdapter:
             return {"status": "submission_uncertain", "error": "unknown_job"}
         with _connect(self.db) as con:
             row = con.execute("SELECT status,error,heartbeat,output_file FROM jobs WHERE id=?", (job_id,)).fetchone()
+            evidence_row = con.execute("SELECT quality_json FROM session_evidence_intents WHERE job_id=?", (job_id,)).fetchone()
         if row is None:
             return {"status": "submission_uncertain", "error": "unknown_job"}
+        session_quality = None
+        if evidence_row is not None:
+            try:
+                session_quality = _stored_session_quality(json.loads(evidence_row[0])) if evidence_row[0] else _stored_session_quality(None)
+            except (ValueError, TypeError):
+                session_quality = _stored_session_quality(None)
         status, error, heartbeat, output_file = row
         if status == "finished_uncertain":
             # Local CLI exit is confirmed, but the remote outcome is not.
             # It does not occupy a live local slot and cannot be re-sent.
-            return {"status": "submission_uncertain", "error": error,
-                    "local_exit_confirmed": True}
+            result = {"status": "submission_uncertain", "error": error,
+                      "local_exit_confirmed": True}
+            if session_quality is not None:
+                result["quality_verification"] = {**_stored_model_quality(None), **session_quality}
+            return result
         if status == "succeeded":
             # Only the expected fixed filename inside the private state root is
             # accepted. A missing/corrupt output does not authorize a retry.
             expected = job_id + ".result.json"
             if output_file != expected:
-                return {"status": "submission_uncertain", "error": "result_unavailable"}
+                result = {"status": "submission_uncertain", "error": "result_unavailable"}
+                if session_quality is not None:
+                    result["quality_verification"] = {**_stored_model_quality(None), **session_quality}
+                return result
             path = self.state_dir / expected
             try:
                 if path.is_symlink() or getattr(path.lstat(), "st_file_attributes", 0) & 0x400:
@@ -243,16 +273,26 @@ class DurableClaudeAdapter:
                 if not isinstance(result, dict) or not isinstance(result.get("output"), str):
                     raise ValueError("invalid result")
                 quality = _stored_model_quality(result.get("quality_verification"))
+                if session_quality is not None:
+                    quality.update(session_quality)
                 return {"status": "succeeded", "output": result["output"],
                         "model_verification": "unverified",
                         "effort_verification": "unverified", "quality_verification": quality}
             except (OSError, ValueError):
-                return {"status": "submission_uncertain", "error": "result_unavailable"}
+                result = {"status": "submission_uncertain", "error": "result_unavailable"}
+                if session_quality is not None:
+                    result["quality_verification"] = {**_stored_model_quality(None), **session_quality}
+                return result
         if status == "reserved" or (status in ("queued", "running") and (not heartbeat or time.time() - heartbeat > 10)):
-            return {"status": "submission_uncertain", "error": "job_state_unavailable"}
+            result = {"status": "submission_uncertain", "error": "job_state_unavailable"}
+            if session_quality is not None:
+                result["quality_verification"] = {**_stored_model_quality(None), **session_quality}
+            return result
         result = {"status": status}
         if error:
             result["error"] = error
+        if session_quality is not None:
+            result["quality_verification"] = {**_stored_model_quality(None), **session_quality}
         return result
 
 
@@ -263,18 +303,48 @@ def _run_worker(state_dir: str, job_id: str) -> None:
     db = state / "jobs.sqlite3"
     def update(status, error=None, output_file=None):
         with _connect(db) as con:
-            con.execute("UPDATE jobs SET status=?,error=?,heartbeat=?,output_file=? WHERE id=?",
-                        (status, error, time.time(), output_file, job_id))
+            changed = con.execute("UPDATE jobs SET status=?,error=?,heartbeat=?,output_file=? WHERE id=? "
+                                  "AND status IN ('reserved','queued','running','submission_uncertain')",
+                                  (status, error, time.time(), output_file, job_id)).rowcount
+        return changed == 1
+
+    def commit_result(output_file, evidence_pending):
+        with _connect(db) as con:
+            con.execute("BEGIN IMMEDIATE")
+            changed = con.execute("UPDATE jobs SET status='succeeded',error=NULL,heartbeat=?,output_file=? "
+                                  "WHERE id=? AND status IN ('reserved','queued','running','submission_uncertain')",
+                                  (time.time(), output_file, job_id)).rowcount
+            if changed != 1:
+                return False
+            if evidence_pending:
+                pending = {**_stored_session_quality(None), "client_evidence_status": "pending",
+                           "session_cleanup": "unconfirmed"}
+                changed = con.execute("UPDATE session_evidence_intents SET quality_json=? "
+                                      "WHERE job_id=? AND session_id=?",
+                                      (json.dumps(pending, ensure_ascii=True), job_id, message["session_id"])).rowcount
+                if changed != 1:
+                    raise ValueError("session intent unavailable")
+        return True
     try:
         raw = sys.stdin.buffer.read(_MAX_INPUT_BYTES + 1)
         if len(raw) > _MAX_INPUT_BYTES:
             raise ValueError("input too large")
         message = json.loads(raw.decode("utf-8"))
         task = message["task"]
+        session_evidence = message.get("session_evidence", False)
+        if type(session_evidence) is not bool:
+            raise ValueError("invalid session mode")
+        if session_evidence:
+            with _connect(db) as con:
+                intent = con.execute("SELECT session_id FROM session_evidence_intents WHERE job_id=?", (job_id,)).fetchone()
+            if intent is None or intent[0] != message.get("session_id"):
+                raise ValueError("missing session intent")
         adapter = ClaudeAdapter(message["cli_path"], message["profile_dir"], message["work_dir"],
                                 message["model"], message["effort"], enabled=True,
-                                timeout_seconds=message["timeout_seconds"], max_concurrency=1)
-        receipt = adapter.submit(task, job_id)
+                                timeout_seconds=message["timeout_seconds"], max_concurrency=1,
+                                session_evidence=session_evidence)
+        receipt = (adapter.submit(task, job_id, _session_id=message["session_id"]) if session_evidence
+                   else adapter.submit(task, job_id))
         if receipt.get("status") != "queued":
             # An uncertain receipt may represent a real submission: preserve
             # its slot and ID rather than falsely marking it as failed.
@@ -286,8 +356,16 @@ def _run_worker(state_dir: str, job_id: str) -> None:
         while True:
             result = adapter.poll(job_id)
             status = result.get("status")
+            if session_evidence and status not in ("queued", "running", "succeeded"):
+                safe_session = _stored_session_quality(None)
+                with _connect(db) as con:
+                    con.execute("UPDATE session_evidence_intents SET quality_json=? WHERE job_id=?",
+                                (json.dumps(safe_session, ensure_ascii=True), job_id))
             if status == "succeeded":
                 filename = job_id + ".result.json"
+                if session_evidence and (result.get("local_exit_confirmed") is not True or result.get("session_bound") is not True):
+                    update("submission_uncertain", "invalid_provider_response")
+                    return
                 try:
                     _atomic_json(state / filename, {"output": result["output"],
                                  "quality_verification": _stored_model_quality(result.get("quality_verification"), message["model"])})
@@ -300,7 +378,32 @@ def _run_worker(state_dir: str, job_id: str) -> None:
                                       else "submission_uncertain")
                     update(durable_status, "result_unavailable")
                     return
-                update("succeeded", output_file=filename)
+                if not commit_result(filename, session_evidence):
+                    return
+                # The answer and its ledger status must already be durable
+                # before any operation that may delete the client session.
+                # A crash or error in collection does not invalidate the
+                # committed result and never authorizes another submission.
+                if session_evidence and result.get("local_exit_confirmed") is True and result.get("session_bound") is True:
+                    # Pending/unconfirmed and succeeded were committed in
+                    # the same transaction before any session access.
+                    try:
+                        if __package__:
+                            from .session_evidence import collect_session_evidence
+                        else:
+                            from session_evidence import collect_session_evidence
+                        safe_session = _stored_session_quality(collect_session_evidence(
+                            message["profile_dir"], message["work_dir"], message["session_id"],
+                            message["model"], message["effort"], process_exit_confirmed=True, enabled=True,
+                            durable_result_saved=True))
+                    except Exception:
+                        return
+                    try:
+                        with _connect(db) as con:
+                            con.execute("UPDATE session_evidence_intents SET quality_json=? WHERE job_id=?",
+                                        (json.dumps(safe_session, ensure_ascii=True), job_id))
+                    except (OSError, sqlite3.Error):
+                        pass
                 return
             if status == "failed":
                 update("failed", result.get("error"))
