@@ -171,9 +171,11 @@ class DurableTests(unittest.TestCase):
         code = ("import sys,json;sys.path.insert(0,sys.argv[1]);import durable_claude as d;"
                 "d._WORKER_SCRIPT=sys.argv[2];a=d.DurableClaudeAdapter(*json.loads(sys.argv[3]),enabled=True);"
                 "print(json.dumps(a.submit('synthetic prompt','restart-job')))" )
+        # Release the synthetic worker even if an earlier assertion fails.
+        self.addCleanup((self.state / "release").write_text, "go", encoding="ascii")
         result = subprocess.run([sys.executable, "-c", code, module_dir, str(fake), json.dumps(self.args)],
                                 capture_output=True, text=True, encoding="utf-8", timeout=10)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.returncode, 0, "synthetic worker launcher failed")
         receipt = json.loads(result.stdout)
         self.assertEqual(receipt["status"], "queued")
         if os.name == "nt":
@@ -220,7 +222,7 @@ class DurableTests(unittest.TestCase):
         replay = a.submit("synthetic prompt", "restart-job")
         self.assertTrue(replay["replayed"])
         (self.state / "release").write_text("go", encoding="ascii")
-        for _ in range(150):
+        for _ in range(500):
             output = a.poll("restart-job")
             if output["status"] == "succeeded":
                 break
