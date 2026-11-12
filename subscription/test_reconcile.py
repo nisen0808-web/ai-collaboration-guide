@@ -128,6 +128,21 @@ class ReconcileTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertNotIn("private", out + err)
 
+    def test_commit_error_does_not_claim_release_failed_or_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for provider, ledger in (("claude", ai_team.claude_ledger), ("grok", ai_team.grok_ledger)):
+                with self.subTest(provider=provider), patch.object(ledger, "operator_release", side_effect=sqlite3.OperationalError("private commit error")) as release:
+                    code, out, err = self.run_main("reconcile", provider, "--data-dir", tmp,
+                                                   "--release", "11111111-1111-4111-8111-111111111111",
+                                                   "--confirm-process-exited")
+                self.assertEqual(code, 1)
+                self.assertIn("Operation not confirmed", err)
+                self.assertIn("Check the original job", err)
+                self.assertIn("do not retry automatically", err)
+                self.assertNotIn("private", out + err)
+                self.assertNotIn("nothing changed", (out + err).lower())
+                release.assert_called_once()
+
     def test_conflicting_finished_state_is_visible_when_blocking(self):
         rows = [{"job_id": "legacy", "state": "finished_uncertain", "worker_state": "unknown"}]
         with patch.object(ai_team.claude_ledger, "blocking_jobs", return_value=rows):

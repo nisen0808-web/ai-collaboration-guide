@@ -200,7 +200,7 @@ class OperatorReleaseTests(unittest.TestCase):
             self.assertEqual(dict(con.execute("SELECT id,status FROM jobs").fetchall()),
                              {"live": "running", "done": "failed"})
 
-    def test_ignored_release_rolls_back_trigger_side_effects(self):
+    def test_ignore_trigger_is_rejected_before_it_can_change_other_jobs(self):
         self.insert("claimed", "running", time.time() - 3600)
         self.insert("other", "running", time.time() - 3600)
         with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con, con:
@@ -214,6 +214,33 @@ class OperatorReleaseTests(unittest.TestCase):
             self.assertEqual(durable.operator_release(str(self.state), "claimed"), "unsafe_state")
         with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
             self.assertEqual(con.execute("SELECT * FROM jobs ORDER BY id").fetchall(), before)
+
+    def test_successful_trigger_that_would_mutate_other_job_is_rejected(self):
+        self.insert("claimed", "running", time.time() - 3600)
+        self.insert("other", "running", time.time() - 3600)
+        with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con, con:
+            con.execute("INSERT INTO worker_claims VALUES (?,?,?)", ("claimed", 42, "42:123"))
+            con.execute("CREATE TRIGGER mutating AFTER UPDATE OF status ON jobs "
+                        "WHEN OLD.id='claimed' BEGIN "
+                        "UPDATE jobs SET error='tampered' WHERE id='other'; END")
+            before = con.execute("SELECT * FROM jobs ORDER BY id").fetchall()
+        with mock.patch.object(durable, "_worker_identity_state", return_value="exited"):
+            self.assertEqual(durable.operator_release(str(self.state), "claimed"), "unsafe_state")
+        with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
+            self.assertEqual(con.execute("SELECT * FROM jobs ORDER BY id").fetchall(), before)
+
+    def test_uppercase_jobs_table_trigger_is_rejected(self):
+        self.insert("claimed", "running", time.time() - 3600)
+        with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con, con:
+            con.execute("INSERT INTO worker_claims VALUES (?,?,?)", ("claimed", 42, "42:123"))
+            con.execute("ALTER TABLE jobs RENAME TO jobs_tmp")
+            con.execute("ALTER TABLE jobs_tmp RENAME TO JOBS")
+            con.execute("CREATE TRIGGER mutating AFTER UPDATE ON JOBS BEGIN SELECT 1; END")
+            before = con.execute("SELECT * FROM JOBS").fetchall()
+        with mock.patch.object(durable, "_worker_identity_state", return_value="exited"):
+            self.assertEqual(durable.operator_release(str(self.state), "claimed"), "unsafe_state")
+        with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
+            self.assertEqual(con.execute("SELECT * FROM JOBS").fetchall(), before)
 
 
 if __name__ == "__main__":

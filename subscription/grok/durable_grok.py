@@ -405,6 +405,10 @@ class _Ledger:
             return "unknown_job"
         with self._connect() as con:
             con.execute("BEGIN IMMEDIATE")
+            # Any jobs trigger can mutate unrelated tasks even if this update
+            # succeeds. Do not perform a release in such a ledger.
+            if con.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name='jobs' COLLATE NOCASE LIMIT 1").fetchone():
+                return "unsafe_state"
             if not con.execute("SELECT 1 FROM jobs WHERE job_id=?", (job_id,)).fetchone():
                 return "unknown_job"
             row = next((item for item in self._active_rows(con) if item["job_id"] == job_id), None)

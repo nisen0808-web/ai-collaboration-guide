@@ -120,6 +120,17 @@ class LegacyRecoveryTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(self.rows(), before)
 
+    def test_uppercase_table_trigger_is_rejected(self):
+        with closing(sqlite3.connect(self.db)) as con, con:
+            con.execute("DROP TABLE jobs")
+            con.execute("CREATE TABLE JOBS (id TEXT PRIMARY KEY, fingerprint TEXT, status TEXT, "
+                        "error TEXT, heartbeat REAL, output_file TEXT)")
+            con.execute("INSERT INTO JOBS VALUES ('old-job','digest','running',NULL,NULL,NULL)")
+            con.execute("CREATE TRIGGER dangerous AFTER UPDATE ON JOBS BEGIN DELETE FROM JOBS; END")
+        with self.assertRaises(ValueError):
+            self.prepare()
+        self.assertEqual(len(self.rows()), 1)
+
     def test_unexpected_audit_schema_aborts_transaction(self):
         self.prepare()
         with closing(sqlite3.connect(self.db)) as con, con:

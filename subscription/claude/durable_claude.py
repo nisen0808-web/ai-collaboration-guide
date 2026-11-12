@@ -208,6 +208,10 @@ def operator_release(state_dir, job_id: str) -> str:
     con.row_factory = sqlite3.Row
     try:
         con.execute("BEGIN IMMEDIATE")
+        # Even an otherwise successful update may fire a trigger that mutates
+        # another task. Refuse the entire ledger while any jobs trigger exists.
+        if con.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' AND tbl_name='jobs' COLLATE NOCASE LIMIT 1").fetchone():
+            return "unsafe_state"
         row = con.execute("SELECT status,error,heartbeat FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             return "unknown_job"

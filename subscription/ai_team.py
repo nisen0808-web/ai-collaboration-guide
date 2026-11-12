@@ -376,7 +376,7 @@ def main(argv: list[str] | None = None) -> int:
             try:
                 return reconcile(args)
             except Exception:
-                print("Unable to read or update the local job ledger.", file=sys.stderr)
+                print("Operation not confirmed. Check the original job before acting; do not retry automatically.", file=sys.stderr)
                 return 1
         if args.mode == "login":
             try:

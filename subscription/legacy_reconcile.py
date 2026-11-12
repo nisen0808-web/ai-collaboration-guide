@@ -91,7 +91,7 @@ def _snapshot(con, provider, job_id):
     if not required.issubset(names) or len(names) != len(set(names)):
         raise ValueError("unsupported schema")
     if con.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' "
-                   "AND tbl_name IN ('jobs','legacy_reconcile_audit')").fetchone():
+                   "AND tbl_name COLLATE NOCASE IN ('jobs','legacy_reconcile_audit')").fetchone():
         raise ValueError("triggers require manual investigation")
     row = con.execute(f'SELECT * FROM jobs WHERE "{key}"=?', (job_id,)).fetchone()
     if row is None or len(row) != len(names):
