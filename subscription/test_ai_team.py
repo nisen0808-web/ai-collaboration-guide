@@ -83,6 +83,9 @@ class EntryPointTests(unittest.TestCase):
 
     def test_existing_profiles_are_used_only_when_explicitly_selected(self):
         with tempfile.TemporaryDirectory() as tmp:
+            # Windows may return an 8.3 short path for the temporary parent;
+            # the entry point intentionally stores resolved absolute paths.
+            tmp = str(Path(tmp).resolve())
             claude_profile = str(Path(tmp, "existing-claude"))
             grok_profile = str(Path(tmp, "existing-grok"))
             args = ai_team.parser().parse_args(["serve", "--data-dir", str(Path(tmp, "state")),
@@ -190,7 +193,7 @@ class EntryPointTests(unittest.TestCase):
 
     def test_install_pins_relative_paths_for_a_different_startup_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp).resolve()
             install_dir, later_dir = root / "install", root / "later"
             install_dir.mkdir()
             later_dir.mkdir()
@@ -233,6 +236,7 @@ class EntryPointTests(unittest.TestCase):
 
     def test_install_keeps_missing_bare_cli_name_and_pins_missing_path(self):
         with tempfile.TemporaryDirectory() as tmp:
+            tmp = str(Path(tmp).resolve())
             previous = Path.cwd()
             stderr = io.StringIO()
             try:
