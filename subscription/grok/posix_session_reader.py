@@ -7,7 +7,9 @@ primitives this module reports unavailable, not success.
 
 Directory file descriptors reduce symlink and replacement races; they cannot
 protect against every malicious process running as the same operating-system
-user. Use a private, dedicated profile and working directory.
+user. Use a private, dedicated profile and working directory. Owner-only
+profile permissions protect non-writable session descendants that the client
+may create with 0755/0644 under a normal umask.
 """
 from __future__ import annotations
 
@@ -64,13 +66,19 @@ def _no_acl(fd):
     return False
 
 
-def _directory_ok(fd, *, private):
+def _directory_ok(fd, *, private, contained=False):
     info = os.fstat(fd)
     if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.geteuid()):
         raise _Unsafe()
     mode = stat.S_IMODE(info.st_mode)
     if private:
         if info.st_uid != os.geteuid() or mode & 0o077 or not _no_acl(fd):
+            raise _Unsafe()
+    elif contained:
+        # Only called below an already held, owner-only profile. Readable
+        # descendants do not expose data without permission to traverse that
+        # private ancestor; write grants and extended ACLs are still rejected.
+        if info.st_uid != os.geteuid() or mode & 0o022 or not _no_acl(fd):
             raise _Unsafe()
     elif mode & 0o022:
         # A root-owned sticky directory such as /tmp protects the private
@@ -102,7 +110,7 @@ def _chain(path, opened):
 def _child_dir(parent, name, opened):
     fd = _open_dir(name, parent=parent)
     opened.append(fd)
-    _directory_ok(fd, private=True)
+    _directory_ok(fd, private=False, contained=True)
     return fd
 
 
@@ -161,7 +169,7 @@ def _read_file(parent, name, max_bytes):
     try:
         before = os.fstat(fd)
         if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid() or
-                stat.S_IMODE(before.st_mode) & 0o077 or before.st_nlink != 1 or
+                stat.S_IMODE(before.st_mode) & 0o022 or before.st_nlink != 1 or
                 before.st_size > max_bytes or not _no_acl(fd)):
             raise _Unsafe()
         chunks, count = [], 0

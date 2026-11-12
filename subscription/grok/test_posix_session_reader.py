@@ -78,7 +78,25 @@ class ReaderTests(unittest.TestCase):
         self.assertFalse(subject.preflight(str(self.profile), str(self.work), self.session))
         self.work.chmod(0o700)
         self._new_records()
-        (self.target / 'usage.json').chmod(0o644)
+        (self.target / 'usage.json').chmod(0o664)
+        self.assertIsNone(subject.read_records(str(self.profile), str(self.work), self.session))
+
+    def test_default_umask_descendants_are_protected_by_private_profile(self):
+        self.assertTrue(subject.preflight(str(self.profile), str(self.work), self.session))
+        self._new_records()
+        for directory in (self.profile / 'sessions', self.bucket, self.target):
+            directory.chmod(0o755)
+        for name in ('summary.json', 'usage.json'):
+            (self.target / name).chmod(0o644)
+        self.assertEqual(subject.read_records(str(self.profile), str(self.work), self.session),
+                         (b'{"synthetic":true}', b'{"synthetic":true}'))
+
+    def test_group_writable_session_dir_or_metadata_rejected(self):
+        self._new_records()
+        self.target.chmod(0o775)
+        self.assertIsNone(subject.read_records(str(self.profile), str(self.work), self.session))
+        self.target.chmod(0o755)
+        (self.target / 'usage.json').chmod(0o664)
         self.assertIsNone(subject.read_records(str(self.profile), str(self.work), self.session))
 
     def test_extended_acl_or_unreadable_acl_rejected(self):

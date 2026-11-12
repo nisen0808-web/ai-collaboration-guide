@@ -48,8 +48,10 @@ For a new successful, complete task, the adapter attempts to inspect only its
 own UUID-bound official client session metadata and usage records. When those
 records are safe, complete and consistent with the requested model and effort,
 the coordinator exposes `client_record_verified: true` together with the
-observed model and effort. `verified` and `server_effort_verified` remain false:
-these are local client records, not a signed attestation of server execution.
+observed model and effort. This is an adapter-reported check; the coordinator
+does not independently authenticate the record's origin. `verified` and
+`server_effort_verified` remain false: these are local client records, not a
+signed attestation of server execution.
 The answer is saved before evidence is read; a later poll can retrieve updated
 evidence, and missing or unsafe evidence leaves the answer usable but unverified.
 This check does not automatically retry the task. It never reads conversation
