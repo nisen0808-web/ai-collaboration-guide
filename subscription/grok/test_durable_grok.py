@@ -394,6 +394,38 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(adapter.submit("synthetic task", "task-1")["job_id"], receipt["job_id"])
         self.assertEqual(launch.call_count, 1)
 
+    def test_worker_saves_answer_before_client_evidence_and_keeps_it_on_failure(self):
+        adapter = self.adapter()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)) as launch:
+            receipt = adapter.submit("synthetic task", "evidence-order")
+        job_id = receipt["job_id"]
+        grok_module = sys.modules[subject.GrokAdapter.__module__]
+        class Child:
+            def __init__(self, argv, **kwargs):
+                kwargs["stdout"].write(b"synthetic answer")
+                kwargs["stdout"].flush()
+            def wait(self, timeout=None):
+                return 0
+        report = {name: [] for name in grok_module._INSPECT_KEYS}
+        def fail_after_saved(*args, **kwargs):
+            saved = adapter.ledger.get(job_id)
+            self.assertEqual(saved.state, "succeeded")
+            self.assertEqual(saved.result["output"], "synthetic answer")
+            self.assertEqual(saved.result["quality_verification"]["client_evidence_status"], "pending")
+            raise OSError("synthetic evidence failure")
+        with mock.patch.object(grok_module.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(report).encode())), \
+             mock.patch.object(grok_module.subprocess, "Popen", side_effect=Child), \
+             mock.patch.object(grok_module.session_evidence, "preflight", return_value=True), \
+             mock.patch.object(grok_module.session_evidence, "collect", side_effect=fail_after_saved):
+            self.assertEqual(subject.worker_main(str(self.root), job_id), 0)
+        state = self.adapter().poll(job_id)
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(state["output"], "synthetic answer")
+        self.assertEqual(state["quality_verification"]["client_evidence_status"], "unavailable")
+        self.assertNotIn("synthetic evidence failure", repr(state))
+        self.assertEqual(adapter.submit("synthetic task", "evidence-order")["reason"], "already_submitted")
+        self.assertEqual(launch.call_count, 1)
+
     def test_worker_survives_actual_launcher_exit_then_new_adapter_polls(self):
         # This starts only synthetic Python processes, never the Grok CLI.
         fake = self.base / "fake_detached_worker.py"

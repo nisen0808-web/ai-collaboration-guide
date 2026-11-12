@@ -458,6 +458,171 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         self.assertNotIn("private response".encode(), self.db.read_bytes())
         self.assertNotIn(b"private prompt", self.db.read_bytes())
 
+    @staticmethod
+    def grok_session_quality(**overrides):
+        value = {"verified": False, "server_effort_verified": False,
+                 "client_evidence_status": "matched", "evidence_source": "official_grok_client_session",
+                 "client_model_matches_requested": True, "client_effort_matches_requested": True,
+                 "observed_model": "grok-synthetic-1", "observed_effort": "xhigh"}
+        value.update(overrides)
+        return value
+
+    def grok_result_with_quality(self, quality, key, *, status="succeeded", truncated=False):
+        class Adapter:
+            def submit(self, **kwargs):
+                return {"status": "queued", "job_id": "job"}
+
+            def poll(self, job_id):
+                return {"status": status, "output": "synthetic", "truncated": truncated,
+                        "quality_verification": quality}
+        coordinator = Coordinator(self.db, {"grok": Adapter()})
+        coordinator.submit("grok", "synthetic task", key)
+        return coordinator.result("grok", key)
+
+    def test_grok_success_exposes_only_client_record_evidence(self):
+        evidence = self.grok_session_quality(private="synthetic-secret", actual_model="synthetic-private",
+                                             arbitrary={"path": "synthetic-private"})
+        result = self.grok_result_with_quality(evidence, "grok-session-match")
+        quality = result["quality_verification"]
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(quality["client_evidence_status"], "matched")
+        self.assertTrue(quality["client_record_verified"])
+        self.assertTrue(quality["client_model_matches_requested"])
+        self.assertTrue(quality["client_effort_matches_requested"])
+        self.assertEqual(quality["observed_model"], "grok-synthetic-1")
+        self.assertEqual(quality["observed_effort"], "xhigh")
+        self.assertEqual(quality["evidence_source"], "official_grok_client_session")
+        self.assertFalse(quality["verified"])
+        self.assertFalse(quality["server_effort_verified"])
+        self.assertTrue(quality["reported_by_adapter"])
+        self.assertFalse(quality["independently_verified_by_coordinator"])
+        self.assertNotIn("synthetic-secret", repr(quality))
+        self.assertNotIn("synthetic-private", repr(quality))
+
+    def test_grok_consistent_client_record_mismatch_is_not_a_match(self):
+        evidence = self.grok_session_quality(client_evidence_status="mismatch",
+                                             client_model_matches_requested=False,
+                                             observed_model="grok-other-1")
+        quality = self.grok_result_with_quality(evidence, "grok-session-mismatch")["quality_verification"]
+        self.assertEqual(quality["client_evidence_status"], "mismatch")
+        self.assertFalse(quality["client_record_verified"])
+        self.assertIs(quality["client_model_matches_requested"], False)
+        self.assertIs(quality["client_effort_matches_requested"], True)
+        self.assertEqual(quality["observed_model"], "grok-other-1")
+        self.assertFalse(quality["verified"])
+        self.assertFalse(quality["server_effort_verified"])
+
+    def test_grok_model_mismatch_can_withhold_untrusted_model_name(self):
+        evidence = self.grok_session_quality(client_evidence_status="mismatch",
+                                             client_model_matches_requested=False,
+                                             observed_model=None)
+        quality = self.grok_result_with_quality(evidence, "grok-withheld-model")["quality_verification"]
+        self.assertEqual(quality["client_evidence_status"], "mismatch")
+        self.assertIs(quality["client_model_matches_requested"], False)
+        self.assertIs(quality["client_effort_matches_requested"], True)
+        self.assertIsNone(quality["observed_model"])
+        self.assertEqual(quality["observed_effort"], "xhigh")
+        self.assertFalse(quality["client_record_verified"])
+        self.assertFalse(quality["verified"])
+        self.assertFalse(quality["server_effort_verified"])
+
+    def test_grok_pending_evidence_stays_unverified_and_answer_is_available(self):
+        evidence = self.grok_session_quality(client_evidence_status="pending",
+                                             client_model_matches_requested=None,
+                                             client_effort_matches_requested=None,
+                                             observed_model=None, observed_effort=None,
+                                             client_record_verified=True)
+        result = self.grok_result_with_quality(evidence, "grok-pending-quality")
+        self.assertEqual(result["status"], "succeeded")
+        self.assertEqual(result["output"], "synthetic")
+        quality = result["quality_verification"]
+        self.assertEqual(quality["client_evidence_status"], "pending")
+        self.assertEqual(quality["evidence_source"], "official_grok_client_session")
+        self.assertIsNone(quality["client_model_matches_requested"])
+        self.assertIsNone(quality["client_effort_matches_requested"])
+        self.assertIsNone(quality["observed_model"])
+        self.assertIsNone(quality["observed_effort"])
+        self.assertFalse(quality["client_record_verified"])
+        self.assertFalse(quality["verified"])
+        self.assertFalse(quality["server_effort_verified"])
+
+    def test_grok_rejects_malformed_or_incomplete_pending_evidence(self):
+        pending = self.grok_session_quality(client_evidence_status="pending",
+                                            client_model_matches_requested=None,
+                                            client_effort_matches_requested=None,
+                                            observed_model=None, observed_effort=None)
+        cases = [dict(pending, client_model_matches_requested=True),
+                 dict(pending, client_effort_matches_requested=False),
+                 dict(pending, observed_model="grok-synthetic-1"),
+                 dict(pending, observed_effort="xhigh"),
+                 dict(pending, evidence_source="synthetic-secret")]
+        missing = dict(pending)
+        del missing["observed_model"]
+        cases.append(missing)
+        for index, value in enumerate(cases):
+            with self.subTest(case=index):
+                quality = self.grok_result_with_quality(value, f"grok-bad-pending-{index}")["quality_verification"]
+                self.assertEqual(quality["client_evidence_status"], "unavailable")
+                self.assertFalse(quality["client_record_verified"])
+                self.assertFalse(quality["verified"])
+                self.assertFalse(quality["server_effort_verified"])
+                self.assertNotIn("synthetic-secret", repr(quality))
+        truncated = self.grok_result_with_quality(pending, "grok-truncated-pending", truncated=True)
+        self.assertEqual(truncated["quality_verification"]["client_evidence_status"], "unavailable")
+        self.assertFalse(truncated["quality_verification"]["client_record_verified"])
+
+    def test_grok_rejects_forged_missing_or_contradictory_client_evidence(self):
+        synthetic_key = "x" + "ai-" + "0123456789abcdef"
+        variants = (
+            {"verified": True}, {"server_effort_verified": True},
+            {"evidence_source": "synthetic-secret"},
+            {"client_evidence_status": "unavailable"},
+            {"client_evidence_status": "matched", "client_model_matches_requested": False},
+            {"client_evidence_status": "mismatch"},
+            {"client_evidence_status": "mismatch", "client_effort_matches_requested": False,
+             "observed_model": None},
+            {"client_model_matches_requested": 1}, {"client_effort_matches_requested": "true"},
+            {"observed_model": "synthetic-secret"}, {"observed_model": "grok-" + synthetic_key},
+            {"observed_effort": "xhigh-synthetic-secret"},
+            {"observed_model": None}, {"observed_effort": None},
+        )
+        for index, changes in enumerate(variants):
+            with self.subTest(changes=changes):
+                quality = self.grok_result_with_quality(self.grok_session_quality(**changes),
+                                                        f"grok-invalid-{index}")["quality_verification"]
+                self.assertFalse(quality["verified"])
+                self.assertFalse(quality["server_effort_verified"])
+                self.assertFalse(quality["client_record_verified"])
+                self.assertEqual(quality["client_evidence_status"], "unavailable")
+                self.assertEqual(quality["evidence_source"], "not_verified")
+                self.assertIsNone(quality["client_model_matches_requested"])
+                self.assertIsNone(quality["client_effort_matches_requested"])
+                self.assertNotIn("observed_model", quality)
+                self.assertNotIn("observed_effort", quality)
+                self.assertNotIn("synthetic-secret", repr(quality))
+                self.assertNotIn(synthetic_key, repr(quality))
+
+    def test_grok_never_claims_client_match_for_failed_or_truncated_result(self):
+        for index, (status, truncated) in enumerate((("failed", False), ("running", False),
+                                                     ("succeeded", True), ("succeeded", None))):
+            with self.subTest(status=status, truncated=truncated):
+                # An explicitly invalid truncation type causes a conservative
+                # poll failure, while a truncated success is incomplete.
+                result = self.grok_result_with_quality(self.grok_session_quality(client_record_verified=True),
+                                                       f"grok-not-complete-{index}",
+                                                       status=status, truncated=truncated)
+                if truncated is None:
+                    self.assertEqual(result["status"], "submission_uncertain")
+                    self.assertNotIn("quality_verification", result)
+                    continue
+                quality = result["quality_verification"]
+                self.assertEqual(quality["client_evidence_status"], "unavailable")
+                self.assertFalse(quality["client_record_verified"])
+                self.assertFalse(quality["verified"])
+                self.assertNotIn("observed_model", quality)
+                if truncated:
+                    self.assertEqual(result["status"], "incomplete")
+
     def test_poll_failure_and_missing_result_never_become_success(self):
         class Adapter:
             def submit(self, **kw): return {"status": "queued", "job_id": "worker-1"}

@@ -10,12 +10,60 @@ import unittest
 from unittest.mock import patch
 
 import ai_team
+import mcp_stdio
 from coordinator import Coordinator
 from claude.claude_adapter import ClaudeAdapter
 from grok.grok_adapter import GrokAdapter
 
 
 class EndToEndTests(unittest.TestCase):
+    def test_grok_client_evidence_reaches_mcp_without_claiming_server_attestation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            cli, profile = root / "synthetic-grok", root / "profile"
+            cli.touch()
+            profile.mkdir()
+            adapter = GrokAdapter(str(cli), "grok-4.7", "xhigh", str(profile))
+            core = Coordinator(root / "ledger.sqlite", {"grok": adapter})
+            report = {k: [] for k in ("hooks", "plugins", "mcpServers", "skills", "lspServers", "projectInstructions")}
+            class Child:
+                def __init__(self, argv, **kwargs):
+                    kwargs["stdout"].write(b"synthetic answer")
+                    kwargs["stdout"].flush()
+                def wait(self, timeout=None):
+                    return 0
+            evidence = {"client_evidence_status": "matched", "client_model_matches_requested": True,
+                        "client_effort_matches_requested": True, "observed_model": "grok-4.7",
+                        "observed_effort": "xhigh", "evidence_source": "official_grok_client_session",
+                        "server_effort_verified": False}
+            def call(name, arguments):
+                response = mcp_stdio.handle(core, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": {"name": name, "arguments": arguments}})
+                self.assertFalse(response["result"]["isError"])
+                return response["result"]["structuredContent"]
+            with patch("subprocess.run", return_value=subprocess.CompletedProcess([], 0, json.dumps(report).encode())), \
+                 patch("subprocess.Popen", side_effect=Child) as launch, \
+                 patch("grok.session_evidence.preflight", return_value=True), \
+                 patch("grok.session_evidence.collect", return_value=evidence):
+                receipt = call("collab_submit", {"provider": "grok", "task": "synthetic", "request_key": "new-key"})
+                self.assertEqual(receipt["status"], "queued")
+                deadline = time.monotonic() + 3
+                result = {}
+                while time.monotonic() < deadline:
+                    result = call("collab_result", {"provider": "grok", "request_key": "new-key"})
+                    if result.get("quality_verification", {}).get("client_record_verified") is True:
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(result["status"], "succeeded")
+                self.assertEqual(result["output"], "synthetic answer")
+                quality = result["quality_verification"]
+                self.assertTrue(quality["client_record_verified"])
+                self.assertEqual(quality["observed_model"], "grok-4.7")
+                self.assertEqual(quality["observed_effort"], "xhigh")
+                self.assertFalse(quality["verified"])
+                self.assertFalse(quality["server_effort_verified"])
+                self.assertEqual(launch.call_count, 1)
+
     def test_two_simulated_clis_submit_and_return_independent_answers(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

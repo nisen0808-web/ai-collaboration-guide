@@ -24,7 +24,7 @@ Important limitations before release: this implementation uses temporary task
 files; Windows ACL protection has not been independently verified. It captures
 inspection output in memory and does not enforce a streaming size cap. It does
 not verify CLI binary authenticity, effective managed configuration, account
-status, model/effort, or per-request billing. A timed-out process can continue;
+status, server-side effective effort, or per-request billing. A timed-out process can continue;
 its task/output files are preserved and its status is `submission_uncertain`.
 While this host process remains alive, its worker continues waiting on the same
 original child and can collect the eventual outcome without a second request.
@@ -37,13 +37,26 @@ inspection found bundled skills not explicitly disabled. A different new task th
 expected answer after those skills were disabled in an exclusive test profile.
 The latest exact official session summary and usage records together reported
 `grok-4.7`, `grok-4.7-build`, and `xhigh`.
-The coordinator separately checked these records against its quality policy;
-this candidate still reports quality as unverified and cannot perform that
-check automatically. The damaged-ledger recovery paths were tested offline;
+The coordinator separately checked those records against its quality policy;
+the earlier tested revision did not perform that check automatically. The damaged-ledger recovery paths were tested offline;
 this successful task does not establish their behavior. Other CLI versions
 have not been checked. This does not establish privacy, billing or cross-platform
 compatibility. Do not use this candidate for real tasks until it has been
 independently reviewed.
+
+For a new successful, complete task, the adapter attempts to inspect only its
+own UUID-bound official client session metadata and usage records. When those
+records are safe, complete and consistent with the requested model and effort,
+the coordinator exposes `client_record_verified: true` together with the
+observed model and effort. `verified` and `server_effort_verified` remain false:
+these are local client records, not a signed attestation of server execution.
+The answer is saved before evidence is read; a later poll can retrieve updated
+evidence, and missing or unsafe evidence leaves the answer usable but unverified.
+This check does not automatically retry the task. It never reads conversation
+files or deletes session data; the official client may itself persist prompts,
+answers, paths and sidecars, so use a private dedicated profile. Filesystem
+permissions, unsupported platforms, unusually long encoded work paths, a CLI
+format change, or missing/inconsistent records can prevent verification.
 
 An inspection rejection retains the existing fixed error
 `unexpected_or_unknown_extensions` and can additionally expose a fixed,

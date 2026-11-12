@@ -18,8 +18,10 @@ import uuid
 
 if __package__:
     from .inspect_policy import INSPECTION_REASONS, inspect_report_diagnostics
+    from . import session_evidence
 else:
     from inspect_policy import INSPECTION_REASONS, inspect_report_diagnostics
+    import session_evidence
 
 
 _NETWORK_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
@@ -166,6 +168,7 @@ class GrokAdapter:
         launched = False
         safe_cleanup = True
         preserve_output = False
+        evidence_preflight = False
         try:
             work = Path(tempfile.mkdtemp(prefix="grok-collab-"))
             home = work / "home"
@@ -197,6 +200,12 @@ class GrokAdapter:
                 self._update(job_id, **fields)
                 return
             self._update(job_id, inspection_metadata_unverified=diagnostics["unverified_metadata"])
+            # Failure to establish a safe, new session does not prevent the
+            # user's task: the answer remains available without verification.
+            try:
+                evidence_preflight = session_evidence.preflight(str(self.profile), str(work), job_id) is True
+            except Exception:
+                evidence_preflight = False
             # Windows ACLs inherit from temp directory: do not claim Unix mode
             # alone protects private data on Windows.
             descriptor = os.open(prompt, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -254,9 +263,32 @@ class GrokAdapter:
                              error="empty_result", local_exit_confirmed=True)
                 return
             truncated = len(data) > _MAX_RESULT_BYTES
+            # Persist the answer before examining any optional client records.
+            # A crash or filesystem failure during evidence collection cannot
+            # erase a completed result or cause a new provider submission.
+            pending = {"verified": False, "client_evidence_status": "pending" if evidence_preflight and not truncated else "unavailable",
+                       "client_model_matches_requested": None, "client_effort_matches_requested": None,
+                       "observed_model": None, "observed_effort": None,
+                       "evidence_source": "official_grok_client_session", "server_effort_verified": False}
             self._update(job_id, status="succeeded", phase="completed", error=None,
                          output=data[:_MAX_RESULT_BYTES].decode("utf-8", errors="replace"),
-                         truncated=truncated, quality_verified=False, billing_verified=False)
+                         truncated=truncated, quality_verified=False, billing_verified=False,
+                         quality_verification=pending)
+            if evidence_preflight and not truncated:
+                try:
+                    evidence = session_evidence.collect(str(self.profile), str(work), job_id, self.model, self.effort,
+                                                        preflight_ok=True, process_exit_confirmed=True)
+                    if not isinstance(evidence, dict):
+                        raise ValueError("invalid evidence")
+                    evidence = {**evidence, "verified": False, "server_effort_verified": False}
+                except Exception:
+                    evidence = {**pending, "client_evidence_status": "unavailable"}
+                try:
+                    self._update(job_id, quality_verification=evidence)
+                except Exception:
+                    # The saved successful answer stays terminal; evidence may
+                    # remain pending rather than replacing it with an error.
+                    pass
         except Exception:
             if launched:
                 # Retain any output after a failed read or metadata write.

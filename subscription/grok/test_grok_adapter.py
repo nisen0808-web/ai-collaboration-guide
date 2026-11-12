@@ -88,6 +88,53 @@ class AdapterTests(unittest.TestCase):
             self.assertEqual(self.instance.submit("different", "task-1")["reason"], "task_id_conflict")
             self.assertEqual(len(seen), 2)
 
+    def test_client_evidence_updates_after_success_without_resubmitting(self):
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        evidence = {"client_evidence_status": "matched", "client_model_matches_requested": True,
+                    "client_effort_matches_requested": True, "observed_model": "example-model",
+                    "observed_effort": "high", "evidence_source": "official_grok_client_session",
+                    "server_effort_verified": False}
+        def collect(*args, **kwargs):
+            entered.set()
+            if not release.wait(3):
+                raise RuntimeError("fixture timeout")
+            return evidence
+        with mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(self.report).encode())), \
+             mock.patch.object(subject.subprocess, "Popen", side_effect=FakeChild) as started, \
+             mock.patch.object(subject.session_evidence, "preflight", return_value=True), \
+             mock.patch.object(subject.session_evidence, "collect", side_effect=collect) as collected:
+            receipt = self.instance.submit("synthetic", "client-evidence")
+            self.assertTrue(entered.wait(3))
+            pending = self.instance.poll(receipt["job_id"])
+            self.assertEqual(pending["status"], "succeeded")
+            self.assertEqual(pending["output"], "synthetic answer")
+            self.assertEqual(pending["quality_verification"]["client_evidence_status"], "pending")
+            release.set()
+            self.available(2)
+            final = self.instance.poll(receipt["job_id"])
+            self.assertEqual(final["quality_verification"]["client_evidence_status"], "matched")
+            self.assertIs(final["quality_verification"]["verified"], False)
+            self.assertIs(final["quality_verification"]["server_effort_verified"], False)
+            self.assertEqual(started.call_count, 1)
+            self.assertEqual(collected.call_count, 1)
+
+    def test_unsafe_or_failed_evidence_never_loses_successful_answer(self):
+        for index, (ready, failure) in enumerate(((False, False), (True, True))):
+            with self.subTest(ready=ready), \
+                 mock.patch.object(subject.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(self.report).encode())), \
+                 mock.patch.object(subject.subprocess, "Popen", side_effect=FakeChild) as started, \
+                 mock.patch.object(subject.session_evidence, "preflight", return_value=ready), \
+                 mock.patch.object(subject.session_evidence, "collect", side_effect=OSError("private diagnostic")) as collected:
+                receipt = self.instance.submit("synthetic", f"unsafe-evidence-{index}")
+                self.available(2)
+                state = self.instance.poll(receipt["job_id"])
+                self.assertEqual(state["status"], "succeeded")
+                self.assertEqual(state["output"], "synthetic answer")
+                self.assertEqual(state["quality_verification"]["client_evidence_status"], "unavailable")
+                self.assertNotIn("private diagnostic", repr(state))
+                self.assertEqual(started.call_count, 1)
+                self.assertEqual(collected.call_count, int(failure))
     def test_proxy_and_ca_are_forwarded_without_inheriting_api_keys(self):
         source = {key: "synthetic-value" for key in subject._NETWORK_ENV_NAMES}
         source.update({"https_proxy": "http://synthetic-user:synthetic-password@127.0.0.1:8080",

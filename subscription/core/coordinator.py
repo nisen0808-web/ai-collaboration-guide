@@ -77,6 +77,56 @@ def _result_unavailable(current: dict, reason: str) -> dict:
     return {**current, "status": "submission_uncertain", "poll_error": reason}
 
 
+def _grok_client_quality_projection(quality: dict, *, complete_success: bool) -> dict:
+    """Expose only consistent client-record evidence, never infer server attestation.
+
+    This is an adapter-reported projection, not independent verification by
+    the coordinator. A missing, contradictory or unsafe observation must not
+    promote a task's quality or leak arbitrary metadata.
+    """
+    safe = {"verified": False, "server_effort_verified": False, "client_record_verified": False,
+            "client_evidence_status": "unavailable", "evidence_source": "not_verified",
+            "client_model_matches_requested": None, "client_effort_matches_requested": None}
+    if not complete_success or quality.get("verified") is not False or quality.get("server_effort_verified") is not False:
+        return safe
+    if quality.get("evidence_source") != "official_grok_client_session":
+        return safe
+    status = quality.get("client_evidence_status")
+    if status == "pending":
+        pending_fields = ("client_model_matches_requested", "client_effort_matches_requested",
+                          "observed_model", "observed_effort")
+        if all(key in quality and quality[key] is None for key in pending_fields):
+            safe.update(client_evidence_status="pending", evidence_source="official_grok_client_session",
+                        observed_model=None, observed_effort=None)
+        return safe
+    model_match = quality.get("client_model_matches_requested")
+    effort_match = quality.get("client_effort_matches_requested")
+    model = quality.get("observed_model")
+    effort = quality.get("observed_effort")
+    safe_model = (isinstance(model, str) and
+                  re.fullmatch(r"grok-[A-Za-z0-9][A-Za-z0-9._-]{0,89}", model) is not None)
+    # A mismatched model's name may deliberately be withheld to prevent
+    # leaking arbitrary untrusted metadata. A claimed match still requires a
+    # safe observed name, including when only effort mismatched.
+    withheld_mismatch = status == "mismatch" and model_match is False and model is None
+    if (status not in ("matched", "mismatch") or type(model_match) is not bool or
+            type(effort_match) is not bool or not (safe_model or withheld_mismatch) or
+            effort not in ("low", "medium", "high", "xhigh")):
+        return safe
+    # A valid-looking model string still must not contain a recognized token
+    # format. Raw session data, paths and diagnostics are never projected.
+    if model is not None and re.search(r"(?:sk-(?:ant|proj)-[A-Za-z0-9_-]{10,}|xai-[A-Za-z0-9_-]{10,}|gh[pousr]_[A-Za-z0-9]{15,})", model, re.I):
+        return safe
+    if ((status == "matched" and not (model_match and effort_match)) or
+            (status == "mismatch" and model_match and effort_match)):
+        return safe
+    safe.update(client_evidence_status=status, client_record_verified=status == "matched",
+                evidence_source="official_grok_client_session",
+                client_model_matches_requested=model_match, client_effort_matches_requested=effort_match,
+                observed_model=model, observed_effort=effort)
+    return safe
+
+
 class Coordinator:
     """At-most-once dispatch, with conservative recovery from unknown outcomes.
 
@@ -367,6 +417,9 @@ class Coordinator:
             safe = {key: quality[key] for key in flags if type(quality.get(key)) is bool}
             safe.update({key: quality[key] for key in strings if isinstance(quality.get(key), str)
                          and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}", quality[key])})
+            if provider == "grok":
+                safe = _grok_client_quality_projection(
+                    quality, complete_success=actual == "succeeded" and response.get("truncated") is False)
             if provider == "claude":
                 # The current CLI JSON does not attest the effort used for
                 # the response; adapter claims cannot promote it to verified.
