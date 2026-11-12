@@ -252,7 +252,7 @@ class DurableTests(unittest.TestCase):
             def __init__(self, *_args, **_kwargs): pass
             def submit(self, task, task_id, **kwargs): return {"status": "queued", "job_id": task_id}
             def poll(self, job_id):
-                return {"status": "failed", "error": "provider_reported_error", "session_quality": {
+                return {"status": "failed", "error": "provider_reported_error", "local_exit_confirmed": True, "session_quality": {
                     "client_evidence_status": "unavailable", "client_model_matches_requested": None,
                     "client_effort_matches_requested": None, "session_cleanup": "not_attempted",
                     "private": "synthetic-private"}}
@@ -265,6 +265,62 @@ class DurableTests(unittest.TestCase):
         self.assertIsNone(result["quality_verification"]["client_effort_matches_requested"])
         self.assertNotIn(session_id, repr(result))
         self.assertNotIn("synthetic-private", repr(result))
+
+    def test_opt_in_rejects_conflicting_exit_without_saving_collecting_or_relaunching(self):
+        cases = (
+            {"local_exit_confirmed": True, "error": "process_exit_unconfirmed"},
+            {"local_exit_confirmed": True, "error": "process_still_running"},
+            {"local_exit_confirmed": True, "error": "worker_identity_unconfirmed"},
+            {"local_exit_confirmed": True, "release_basis": "operator_confirmed"},
+            {"local_exit_confirmed": False},
+            {"local_exit_confirmed": 1},
+            {},
+        )
+        for evidence in cases:
+            with self.subTest(evidence=evidence):
+                nested = DurableTests("runTest")
+                nested.setUp()
+                try:
+                    a = nested.adapter(session_evidence=True, max_concurrency=1)
+                    nested.insert("conflicting-session", "reserved")
+                    session_id = "319d322a-a582-459c-abd0-e2d7676cad1b"
+                    fingerprint = hashlib.sha256(json.dumps(
+                        ["synthetic prompt", "claude-synthetic", "medium", "client_session_evidence_v1"],
+                        ensure_ascii=True).encode("ascii")).hexdigest()
+                    with durable._connect(a.db) as con:
+                        con.execute("UPDATE jobs SET fingerprint=? WHERE id=?", (fingerprint, "conflicting-session"))
+                        con.execute("INSERT INTO session_evidence_intents VALUES (?,?,NULL)",
+                                    ("conflicting-session", session_id))
+                    message = {"task": "synthetic prompt", "cli_path": str(nested.cli),
+                               "profile_dir": str(nested.profile), "work_dir": str(nested.work),
+                               "model": "claude-synthetic", "effort": "medium", "timeout_seconds": 900,
+                               "session_evidence": True, "session_id": session_id}
+                    class FakeAdapter:
+                        def __init__(self, *_args, **_kwargs): pass
+                        def submit(self, task, task_id, **_kwargs): return {"status": "queued", "job_id": task_id}
+                        def poll(self, job_id):
+                            return {"status": "succeeded", "output": "synthetic-private",
+                                    "session_bound": True, **evidence}
+                    fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
+                    with patch("durable_claude.ClaudeAdapter", FakeAdapter), \
+                         patch("durable_claude.sys.stdin", fake_stdin), \
+                         patch("durable_claude._atomic_json") as write, \
+                         patch("session_evidence.collect_session_evidence") as collector:
+                        durable._run_worker(str(nested.state), "conflicting-session")
+                    result = a.poll("conflicting-session")
+                    self.assertEqual(result["status"], "submission_uncertain")
+                    self.assertEqual(result["error"], "invalid_provider_response")
+                    self.assertNotIn("output", result)
+                    self.assertNotIn("synthetic-private", repr(result))
+                    self.assertEqual(a.status()["local_active"], 1)
+                    write.assert_not_called()
+                    collector.assert_not_called()
+                    with patch("durable_claude.subprocess.Popen", side_effect=AssertionError("must not relaunch")):
+                        replay = a.submit("synthetic prompt", "conflicting-session")
+                    self.assertEqual(replay["status"], "submission_uncertain")
+                    self.assertTrue(replay["replayed"])
+                finally:
+                    nested.doCleanups()
 
     def _run_session_persistence_case(self, fault):
         a = self.adapter(session_evidence=True)
@@ -454,7 +510,7 @@ class DurableTests(unittest.TestCase):
             def __init__(self, *_args, **_kwargs):
                 self.events = iter([{"status": "running"},
                                     {"status": "submission_uncertain", "error": "provider_slow"},
-                                    {"status": "succeeded", "output": "synthetic response"}])
+                                    {"status": "succeeded", "output": "synthetic response", "local_exit_confirmed": True}])
             def submit(self, task, task_id):
                 if task != "synthetic prompt" or task_id != "worker-job":
                     raise AssertionError("unexpected worker input")
@@ -591,20 +647,20 @@ class DurableTests(unittest.TestCase):
         self.assertFalse(legacy["quality_verification"]["model_usage_matches_requested"])
         self.assertFalse(legacy["quality_verification"]["effort_verified"])
 
-    def test_worker_persists_only_boolean_exit_evidence_and_rejects_conflicts(self):
+    def test_worker_persists_confirmed_exit_and_blocks_invalid_success_evidence(self):
         a = self.adapter()
         message = {"task": "synthetic prompt", "cli_path": str(self.cli),
                    "profile_dir": str(self.profile), "work_dir": str(self.work),
                    "model": "claude-synthetic", "effort": "medium", "timeout_seconds": 900}
         cases = (
             ("true", {"local_exit_confirmed": True}, True),
-            ("false", {"local_exit_confirmed": False}, False),
+            ("false", {"local_exit_confirmed": False}, None),
             ("number", {"local_exit_confirmed": 1}, None),
             ("string", {"local_exit_confirmed": "synthetic-private"}, None),
             ("null", {"local_exit_confirmed": None}, None),
             ("missing", {}, None),
-            ("conflict", {"local_exit_confirmed": True, "error": "process_exit_unconfirmed"}, False),
-            ("operator", {"local_exit_confirmed": True, "release_basis": "operator_confirmed"}, False),
+            ("conflict", {"local_exit_confirmed": True, "error": "process_exit_unconfirmed"}, None),
+            ("operator", {"local_exit_confirmed": True, "release_basis": "operator_confirmed"}, None),
         )
         for suffix, evidence, expected in cases:
             with self.subTest(case=suffix):
@@ -617,16 +673,19 @@ class DurableTests(unittest.TestCase):
                 fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
                 with patch("durable_claude.ClaudeAdapter", FakeAdapter), patch("durable_claude.sys.stdin", fake_stdin):
                     durable._run_worker(str(self.state), job)
-                saved = json.loads((self.state / (job + ".result.json")).read_text(encoding="utf-8"))
                 projected = a.poll(job)
-                self.assertEqual(projected["status"], "succeeded")
                 if expected is None:
-                    self.assertNotIn("local_exit_confirmed", saved)
+                    self.assertEqual(projected["status"], "submission_uncertain")
+                    self.assertEqual(projected["error"], "invalid_provider_response")
+                    self.assertFalse((self.state / (job + ".result.json")).exists())
                     self.assertNotIn("local_exit_confirmed", projected)
+                    self.assertNotIn("output", projected)
                 else:
+                    self.assertEqual(projected["status"], "succeeded")
+                    saved = json.loads((self.state / (job + ".result.json")).read_text(encoding="utf-8"))
                     self.assertIs(saved["local_exit_confirmed"], expected)
                     self.assertIs(projected["local_exit_confirmed"], expected)
-                self.assertNotIn("synthetic-private", repr(saved))
+                self.assertNotIn("synthetic-private", repr(projected))
 
     def test_poll_only_projects_safe_boolean_exit_from_stored_result(self):
         a = self.adapter()
@@ -680,7 +739,7 @@ class DurableTests(unittest.TestCase):
             def __init__(self, *_args, **_kwargs): pass
             def submit(self, task, task_id): return {"status": "queued", "job_id": task_id}
             def poll(self, job_id):
-                return {"status": "succeeded", "output": "ok", "quality_verification": {
+                return {"status": "succeeded", "output": "ok", "local_exit_confirmed": True, "quality_verification": {
                     "model_usage_matches_requested": True, "recorded_model": "claude-example-2",
                     "evidence_source": "cli_result_model_usage"}}
         fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))

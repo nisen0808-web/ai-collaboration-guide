@@ -39,7 +39,9 @@ _BLOCKING_PARAMS = _ACTIVE + _EXIT_UNCONFIRMED
 
 
 def _confirmed_exit(result):
-    return result.get("local_exit_confirmed") is True and result.get("error") not in _EXIT_UNCONFIRMED
+    return (result.get("local_exit_confirmed") is True
+            and result.get("error") not in _EXIT_UNCONFIRMED
+            and result.get("release_basis") != "operator_confirmed")
 
 
 def _stored_local_exit(result, record_error=None):
@@ -587,7 +589,10 @@ def _run_worker(state_dir: str, job_id: str) -> None:
                                 (json.dumps(safe_session, ensure_ascii=True), job_id))
             if status == "succeeded":
                 filename = job_id + ".result.json"
-                if session_evidence and (result.get("local_exit_confirmed") is not True or result.get("session_bound") is not True):
+                # A new successful result must have positive, non-conflicting
+                # local process-exit evidence before it can free the slot.
+                # Older persisted successes remain readable without inferring it.
+                if not _confirmed_exit(result) or (session_evidence and result.get("session_bound") is not True):
                     update("submission_uncertain", "invalid_provider_response")
                     return
                 try:
@@ -612,7 +617,7 @@ def _run_worker(state_dir: str, job_id: str) -> None:
                 # before any operation that may delete the client session.
                 # A crash or error in collection does not invalidate the
                 # committed result and never authorizes another submission.
-                if session_evidence and result.get("local_exit_confirmed") is True and result.get("session_bound") is True:
+                if session_evidence and _confirmed_exit(result) and result.get("session_bound") is True:
                     # Pending/unconfirmed and succeeded were committed in
                     # the same transaction before any session access.
                     try:
@@ -634,7 +639,12 @@ def _run_worker(state_dir: str, job_id: str) -> None:
                         pass
                 return
             if status == "failed":
-                update("failed", result.get("error"))
+                # An explicit pre-launch failure has not started a model CLI.
+                # Any other failure only releases the slot with verified exit.
+                error = result.get("error")
+                prelaunch = (error in {"subscription_login_unavailable", "preflight_error", "session_evidence_unavailable"}
+                             and result.get("release_basis") != "operator_confirmed")
+                update("failed" if prelaunch or _confirmed_exit(result) else "submission_uncertain", error)
                 return
             if status == "submission_uncertain" and result.get("error") != "provider_slow":
                 # Only an explicit, verified local exit can free this local

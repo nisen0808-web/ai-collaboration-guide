@@ -49,8 +49,9 @@ class ConfirmedExitTests(unittest.TestCase):
         write_control = (patch.object(durable_claude, "_atomic_json", side_effect=OSError("synthetic write failure"))
                          if fail_write else nullcontext())
         with patch.object(durable_claude, "ClaudeAdapter", FakeAdapter), \
-             patch.object(durable_claude.sys, "stdin", fake_stdin), write_control:
+             patch.object(durable_claude.sys, "stdin", fake_stdin), write_control as writer:
             durable_claude._run_worker(str(self.state), "job-1")
+        self.write_attempts = writer.call_count if fail_write else None
         return persistent, persistent.poll("job-1")
 
     def test_uncertain_initial_receipt_retains_original_slot(self):
@@ -113,6 +114,7 @@ class ConfirmedExitTests(unittest.TestCase):
             {"status": "succeeded", "output": "synthetic", "local_exit_confirmed": True}, fail_write=True)
         self.assertEqual(result["status"], "submission_uncertain")
         self.assertEqual(result["error"], "result_unavailable")
+        self.assertEqual(self.write_attempts, 1)
         self.assertTrue(result["local_exit_confirmed"])
         self.assertNotIn("output", result)
         self.assertEqual(adapter.status()["local_active"], 0)
@@ -126,13 +128,62 @@ class ConfirmedExitTests(unittest.TestCase):
         self.assertEqual(replay["job_id"], "job-1")
         self.assertTrue(replay["replayed"])
 
-    def test_write_failure_without_confirmed_exit_retains_slot(self):
+    def test_success_without_confirmed_exit_stops_before_write_and_retains_slot(self):
         adapter, result = self._run_receipt({"status": "queued"},
             {"status": "succeeded", "output": "synthetic"}, fail_write=True)
         self.assertEqual(result["status"], "submission_uncertain")
-        self.assertEqual(result["error"], "result_unavailable")
+        self.assertEqual(result["error"], "invalid_provider_response")
+        self.assertEqual(self.write_attempts, 0)
         self.assertNotIn("output", result)
         self.assertEqual(adapter.status()["local_active"], 1)
+
+    def test_operator_confirmed_exit_does_not_free_uncertain_or_failed_job(self):
+        for status in ("submission_uncertain", "failed"):
+            with self.subTest(status=status):
+                adapter, result = self._run_receipt({"status": "queued"},
+                    {"status": status, "error": "provider_process_failed", "local_exit_confirmed": True,
+                     "release_basis": "operator_confirmed"})
+                self.assertEqual(result["status"], "submission_uncertain")
+                self.assertNotEqual(result.get("local_exit_confirmed"), True)
+                self.assertEqual(adapter.status()["local_active"], 1)
+                with durable_claude._connect(adapter.db) as con:
+                    con.execute("DELETE FROM worker_claims")
+                    con.execute("DELETE FROM jobs")
+
+    def test_operator_confirmed_success_stops_before_failing_write_and_keeps_slot(self):
+        adapter, result = self._run_receipt({"status": "queued"},
+            {"status": "succeeded", "output": "synthetic", "local_exit_confirmed": True,
+             "release_basis": "operator_confirmed"}, fail_write=True)
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertEqual(result["error"], "invalid_provider_response")
+        self.assertEqual(self.write_attempts, 0)
+        self.assertNotIn("output", result)
+        self.assertEqual(adapter.status()["local_active"], 1)
+        fingerprint = hashlib.sha256(json.dumps(["synthetic", "model-example", "medium"],
+                                                ensure_ascii=True).encode("ascii")).hexdigest()
+        with durable_claude._connect(adapter.db) as con:
+            con.execute("UPDATE jobs SET fingerprint=? WHERE id='job-1'", (fingerprint,))
+        with patch.object(durable_claude.subprocess, "Popen", side_effect=AssertionError("must not relaunch")):
+            replay = adapter.submit("synthetic", "job-1")
+        self.assertEqual(replay["status"], "submission_uncertain")
+        self.assertTrue(replay["replayed"])
+
+    def test_confirmed_and_prelaunch_failures_release_but_unknown_failures_do_not(self):
+        cases = (
+            ({"status": "failed", "error": "provider_reported_error", "local_exit_confirmed": True}, "failed", 0),
+            ({"status": "failed", "error": "provider_reported_error"}, "submission_uncertain", 1),
+            ({"status": "failed", "error": "process_exit_unconfirmed", "local_exit_confirmed": True}, "submission_uncertain", 1),
+            ({"status": "failed", "error": "preflight_error"}, "failed", 0),
+            ({"status": "failed", "error": "preflight_error", "release_basis": "operator_confirmed"}, "submission_uncertain", 1),
+        )
+        for evidence, expected, slots in cases:
+            with self.subTest(evidence=evidence):
+                adapter, result = self._run_receipt({"status": "queued"}, evidence)
+                self.assertEqual(result["status"], expected)
+                self.assertEqual(adapter.status()["local_active"], slots)
+                with durable_claude._connect(adapter.db) as con:
+                    con.execute("DELETE FROM worker_claims")
+                    con.execute("DELETE FROM jobs")
 
     def test_successful_result_includes_local_exit_evidence(self):
         auth = subprocess.CompletedProcess([], 0, json.dumps({"loggedIn": True, "authMethod": "claude.ai",
