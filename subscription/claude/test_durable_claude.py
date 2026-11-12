@@ -159,7 +159,9 @@ class DurableTests(unittest.TestCase):
         fake.write_text("import json,os,sqlite3,sys,time\n"
                         "state,job=sys.argv[2:4]\n"
                         "request=json.load(sys.stdin)\n"
-                        "deadline=time.monotonic()+5\n"
+                        "with open(os.path.join(state,'worker.pid.tmp'),'w',encoding='ascii') as f: f.write(str(os.getpid()))\n"
+                        "os.replace(os.path.join(state,'worker.pid.tmp'),os.path.join(state,'worker.pid'))\n"
+                        "deadline=time.monotonic()+15\n"
                         "while not os.path.exists(os.path.join(state,'release')) and time.monotonic()<deadline: time.sleep(.01)\n"
                         "name=job+'.result.json'\n"
                         "with open(os.path.join(state,name),'w',encoding='utf-8') as f: json.dump({'output':'synthetic result'},f)\n"
@@ -174,6 +176,45 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         receipt = json.loads(result.stdout)
         self.assertEqual(receipt["status"], "queued")
+        if os.name == "nt":
+            # A completed ledger entry can be visible just before this fake
+            # detached worker exits. Hold a handle to that exact process so
+            # cleanup waits for its natural exit, without terminating it.
+            import ctypes
+            from ctypes import wintypes
+            kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+            kernel.OpenProcess.restype = wintypes.HANDLE
+            kernel.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+            kernel.WaitForSingleObject.restype = wintypes.DWORD
+            kernel.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel.CloseHandle.restype = wintypes.BOOL
+            pid_file = self.state / "worker.pid"
+            deadline = time.monotonic() + 10
+            pid = None
+            while time.monotonic() < deadline:
+                try:
+                    pid = int(pid_file.read_text(encoding="ascii"))
+                    break
+                except (OSError, ValueError):
+                    time.sleep(.02)
+            self.assertIsNotNone(pid, "fake worker did not report its PID")
+            self.assertGreater(pid, 0, "invalid fake worker PID")
+            handle = kernel.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            self.assertTrue(handle, "could not open fake worker process")
+
+            def wait_for_fake_worker():
+                try:
+                    # Also release the fake worker if an earlier assertion
+                    # failed; let it exit normally before directory cleanup.
+                    (self.state / "release").write_text("go", encoding="ascii")
+                    self.assertEqual(kernel.WaitForSingleObject(handle, 10000), 0,
+                                     "fake worker did not exit")
+                finally:
+                    kernel.CloseHandle(handle)
+
+            # addCleanup is LIFO: wait before TemporaryDirectory cleanup.
+            self.addCleanup(wait_for_fake_worker)
         a = self.adapter()
         self.assertNotEqual(a.poll("restart-job")["status"], "succeeded")
         replay = a.submit("synthetic prompt", "restart-job")

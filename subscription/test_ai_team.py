@@ -98,6 +98,29 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(claude.call_args.args[1], claude_profile)
             self.assertEqual(grok.call_args.args[3], grok_profile)
 
+    @unittest.skipUnless(os.name == "nt", "Windows short-path behavior")
+    def test_existing_profiles_expand_windows_short_paths(self):
+        import ctypes
+        from ctypes import wintypes
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp) / "synthetic profile with a long name"
+            profile.mkdir()
+            get_short = ctypes.WinDLL("kernel32", use_last_error=True).GetShortPathNameW
+            get_short.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+            get_short.restype = wintypes.DWORD
+            buf = ctypes.create_unicode_buffer(32768)
+            length = get_short(str(profile), buf, len(buf))
+            if not length or length >= len(buf) or os.path.normcase(buf.value) == os.path.normcase(str(profile)):
+                self.skipTest("Windows short names are unavailable")
+            short_profile = str(Path(buf.value) / "existing-claude")
+            args = ai_team.parser().parse_args(["serve", "--data-dir", str(Path(tmp) / "state"),
+                                                 "--claude-profile", short_profile])
+            with patch.object(ai_team, "executable", return_value="/synthetic/client"), \
+                 patch.object(ai_team, "ClaudeAdapter") as claude, \
+                 patch.object(ai_team, "GrokAdapter"):
+                ai_team.build_adapters(args)
+            self.assertEqual(claude.call_args.args[1], str((profile / "existing-claude").resolve()))
+
     def test_login_invokes_only_selected_official_login(self):
         class Fake:
             def login(self):
