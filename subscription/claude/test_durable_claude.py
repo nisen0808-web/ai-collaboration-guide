@@ -570,11 +570,13 @@ class DurableTests(unittest.TestCase):
             durable._run_worker(str(self.state), "new-result")
         # A new adapter has different current settings: old job evidence is frozen.
         result = self.adapter().poll("new-result")
+        self.assertIs(result["local_exit_confirmed"], True)
         self.assertEqual(result["quality_verification"], {"verified": False, "effort_verified": False,
             "model_usage_matches_requested": True, "recorded_model": "claude-example-1",
             "evidence_source": "cli_result_model_usage"})
         self.assertEqual(result["model_verification"], "unverified")
         raw = (self.state / "new-result.result.json").read_text(encoding="utf-8")
+        self.assertIs(json.loads(raw)["local_exit_confirmed"], True)
         self.assertNotIn("synthetic-private", raw)
         self.assertNotIn("synthetic prompt", raw)
 
@@ -585,8 +587,75 @@ class DurableTests(unittest.TestCase):
                 con.execute("UPDATE jobs SET output_file=? WHERE id=?", ("legacy.result.json", "legacy"))
         legacy = a.poll("legacy")
         self.assertEqual(legacy["status"], "succeeded")
+        self.assertNotIn("local_exit_confirmed", legacy)
         self.assertFalse(legacy["quality_verification"]["model_usage_matches_requested"])
         self.assertFalse(legacy["quality_verification"]["effort_verified"])
+
+    def test_worker_persists_only_boolean_exit_evidence_and_rejects_conflicts(self):
+        a = self.adapter()
+        message = {"task": "synthetic prompt", "cli_path": str(self.cli),
+                   "profile_dir": str(self.profile), "work_dir": str(self.work),
+                   "model": "claude-synthetic", "effort": "medium", "timeout_seconds": 900}
+        cases = (
+            ("true", {"local_exit_confirmed": True}, True),
+            ("false", {"local_exit_confirmed": False}, False),
+            ("number", {"local_exit_confirmed": 1}, None),
+            ("string", {"local_exit_confirmed": "synthetic-private"}, None),
+            ("null", {"local_exit_confirmed": None}, None),
+            ("missing", {}, None),
+            ("conflict", {"local_exit_confirmed": True, "error": "process_exit_unconfirmed"}, False),
+            ("operator", {"local_exit_confirmed": True, "release_basis": "operator_confirmed"}, False),
+        )
+        for suffix, evidence, expected in cases:
+            with self.subTest(case=suffix):
+                job = "exit-" + suffix
+                self.insert(job, "reserved")
+                class FakeAdapter:
+                    def __init__(self, *_args, **_kwargs): pass
+                    def submit(self, task, task_id): return {"status": "queued", "job_id": task_id}
+                    def poll(self, job_id): return {"status": "succeeded", "output": "safe", **evidence}
+                fake_stdin = SimpleNamespace(buffer=io.BytesIO(json.dumps(message).encode("utf-8")))
+                with patch("durable_claude.ClaudeAdapter", FakeAdapter), patch("durable_claude.sys.stdin", fake_stdin):
+                    durable._run_worker(str(self.state), job)
+                saved = json.loads((self.state / (job + ".result.json")).read_text(encoding="utf-8"))
+                projected = a.poll(job)
+                self.assertEqual(projected["status"], "succeeded")
+                if expected is None:
+                    self.assertNotIn("local_exit_confirmed", saved)
+                    self.assertNotIn("local_exit_confirmed", projected)
+                else:
+                    self.assertIs(saved["local_exit_confirmed"], expected)
+                    self.assertIs(projected["local_exit_confirmed"], expected)
+                self.assertNotIn("synthetic-private", repr(saved))
+
+    def test_poll_only_projects_safe_boolean_exit_from_stored_result(self):
+        a = self.adapter()
+        cases = (
+            ("stored-true", {"local_exit_confirmed": True}, True),
+            ("stored-false", {"local_exit_confirmed": False}, False),
+            ("stored-number", {"local_exit_confirmed": 1}, None),
+            ("stored-string", {"local_exit_confirmed": "synthetic-private"}, None),
+            ("stored-missing", {}, None),
+            ("stored-conflict", {"local_exit_confirmed": True, "error": "process_still_running"}, False),
+            ("stored-operator", {"local_exit_confirmed": True, "release_basis": "operator_confirmed"}, False),
+            ("stored-row-conflict", {"local_exit_confirmed": True}, False),
+        )
+        for job, evidence, expected in cases:
+            with self.subTest(job=job):
+                self.insert(job, "succeeded")
+                name = job + ".result.json"
+                (self.state / name).write_text(json.dumps({"output": "safe", **evidence}), encoding="utf-8")
+                with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
+                    with con:
+                        row_error = "worker_identity_unconfirmed" if job == "stored-row-conflict" else None
+                        con.execute("UPDATE jobs SET output_file=?,error=? WHERE id=?", (name, row_error, job))
+                projected = a.poll(job)
+                self.assertEqual(projected["status"], "succeeded")
+                if expected is None:
+                    self.assertNotIn("local_exit_confirmed", projected)
+                else:
+                    self.assertIs(projected["local_exit_confirmed"], expected)
+                self.assertNotIn("synthetic-private", repr(projected))
 
     def test_unrecognized_stored_model_evidence_is_not_forwarded(self):
         a = self.adapter()

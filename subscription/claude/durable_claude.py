@@ -42,6 +42,15 @@ def _confirmed_exit(result):
     return result.get("local_exit_confirmed") is True and result.get("error") not in _EXIT_UNCONFIRMED
 
 
+def _stored_local_exit(result, record_error=None):
+    """Keep only explicit boolean evidence; conflicting exit errors fail closed."""
+    value = result.get("local_exit_confirmed")
+    if type(value) is not bool:
+        return None
+    return bool(value and _confirmed_exit(result) and record_error not in _EXIT_UNCONFIRMED
+                and result.get("release_basis") != "operator_confirmed")
+
+
 def _process_identity(pid: int) -> str | None:
     """Identify a live process by PID and creation time, never by PID alone."""
     if type(pid) is not int or pid <= 0:
@@ -374,7 +383,7 @@ class DurableClaudeAdapter:
             self._set_if_reserved(task_id, "failed", "worker_setup_failed")
             return {"status": "not_submitted", "reason": "worker_unavailable"}
         try:
-            process = subprocess.Popen([sys.executable, _WORKER_SCRIPT, "--worker", str(self.state_dir), task_id], **kwargs)
+            process = subprocess.Popen([sys.executable, "-B", _WORKER_SCRIPT, "--worker", str(self.state_dir), task_id], **kwargs)
         except Exception:
             # A spawn error alone is not a durable proof that no worker was
             # created. Preserve the ID and slot until an operator reconciles.
@@ -463,9 +472,13 @@ class DurableClaudeAdapter:
                 quality = _stored_model_quality(result.get("quality_verification"))
                 if session_quality is not None:
                     quality.update(session_quality)
-                return {"status": "succeeded", "output": result["output"],
+                safe = {"status": "succeeded", "output": result["output"],
                         "model_verification": "unverified",
                         "effort_verification": "unverified", "quality_verification": quality}
+                local_exit = _stored_local_exit(result, error)
+                if local_exit is not None:
+                    safe["local_exit_confirmed"] = local_exit
+                return safe
             except (OSError, ValueError):
                 result = {"status": "submission_uncertain", "error": "result_unavailable"}
                 if session_quality is not None:
@@ -578,8 +591,12 @@ def _run_worker(state_dir: str, job_id: str) -> None:
                     update("submission_uncertain", "invalid_provider_response")
                     return
                 try:
-                    _atomic_json(state / filename, {"output": result["output"],
-                                 "quality_verification": _stored_model_quality(result.get("quality_verification"), message["model"])})
+                    saved = {"output": result["output"],
+                             "quality_verification": _stored_model_quality(result.get("quality_verification"), message["model"])}
+                    local_exit = _stored_local_exit(result)
+                    if local_exit is not None:
+                        saved["local_exit_confirmed"] = local_exit
+                    _atomic_json(state / filename, saved)
                 except Exception:
                     # A completed provider result could not be saved. Never
                     # expose it as a usable result or launch the job again.

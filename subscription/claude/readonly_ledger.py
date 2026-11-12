@@ -127,9 +127,18 @@ class ReadOnlyClaudeLedger:
                 quality = _stored_model_quality(result.get("quality_verification"))
                 if session_quality is not None:
                     quality.update(session_quality)
-                return {"status": "succeeded", "output": result["output"],
-                        "model_verification": "unverified", "effort_verification": "unverified",
-                        "quality_verification": quality}
+                projected = {"status": "succeeded", "output": result["output"],
+                             "model_verification": "unverified", "effort_verification": "unverified",
+                             "quality_verification": quality}
+                # Only a boolean explicitly written in this result can be
+                # projected. Older files must not acquire inferred evidence.
+                local_exit = result.get("local_exit_confirmed")
+                if type(local_exit) is bool:
+                    projected["local_exit_confirmed"] = (
+                        local_exit and error not in _EXIT_UNCONFIRMED
+                        and result.get("error") not in _EXIT_UNCONFIRMED
+                        and result.get("release_basis") != "operator_confirmed")
+                return projected
             except (OSError, ValueError):
                 return attach({"status": "submission_uncertain", "error": "result_unavailable"})
         if status == "reserved" or (status in ("queued", "running") and (not heartbeat or time.time() - heartbeat > 10)):
