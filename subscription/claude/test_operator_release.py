@@ -52,7 +52,7 @@ class OperatorReleaseTests(unittest.TestCase):
         empty = Path(self.tmp.name).resolve() / "absent"
         empty.mkdir()
         self.assertIsNone(durable.blocking_jobs(str(empty)))
-        self.assertEqual(durable.operator_release(str(empty), "job"), "unknown_job")
+        self.assertEqual(durable.operator_release(str(empty), "job"), "ledger_unavailable")
         self.assertEqual(list(empty.iterdir()), [])
 
     def test_reparse_attributes_on_state_or_database_prevent_open(self):

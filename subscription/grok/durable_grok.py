@@ -490,7 +490,7 @@ def blocking_jobs(state_root) -> list[dict] | None:
 
 def operator_release(state_root, job_id: str) -> str:
     ledger = _existing_ledger(state_root)
-    return "unknown_job" if ledger is None else ledger.operator_release(job_id)
+    return "ledger_unavailable" if ledger is None else ledger.operator_release(job_id)
 
 
 def _worker_command(root: Path, job_id: str) -> list[str]:

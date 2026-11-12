@@ -194,7 +194,7 @@ def operator_release(state_dir, job_id: str) -> str:
         return "unknown_job"
     db = _existing_ledger(state_dir)
     if db is None:
-        return "unknown_job"
+        return "ledger_unavailable"
     con = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True, timeout=10)
     con.row_factory = sqlite3.Row
     try:

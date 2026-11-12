@@ -191,6 +191,7 @@ _RELEASE_MESSAGES = {
     "released": "Released by operator confirmation. The remote outcome remains uncertain; no request was resent.",
     "not_blocking": "This job does not hold a local slot; nothing changed.",
     "unknown_job": "No matching job was found in this provider ledger; nothing changed.",
+    "ledger_unavailable": "No accessible safe job ledger; existing jobs were not checked.",
     "worker_running": "The bound worker is still running; nothing changed.",
     "identity_unconfirmed": "The worker identity or exit cannot be confirmed; nothing changed.",
     "unsafe_state": "This job state cannot be safely released; nothing changed.",

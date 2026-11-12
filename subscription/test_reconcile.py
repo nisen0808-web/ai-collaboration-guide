@@ -125,6 +125,17 @@ class ReconcileTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertNotIn("private", out + err)
 
+    def test_release_does_not_claim_unknown_job_when_ledger_not_accessible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for provider in ("claude", "grok"):
+                with self.subTest(provider=provider):
+                    code, out, _ = self.run_main("reconcile", provider, "--data-dir", tmp,
+                                                  "--release", "11111111-1111-4111-8111-111111111111",
+                                                  "--confirm-process-exited")
+                    self.assertEqual(code, 1)
+                    self.assertIn("existing jobs were not checked", out)
+                    self.assertNotIn("No matching job", out)
+
     def test_corrupt_job_records_do_not_echo_secrets_or_terminal_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = [{"job_id": "private\x1b[31m", "state": "sensitive state", "worker_state": "unknown"}]

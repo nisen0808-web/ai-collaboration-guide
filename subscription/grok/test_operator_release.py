@@ -42,7 +42,7 @@ class OperatorReleaseTests(unittest.TestCase):
         empty = Path(self.temp.name).resolve() / "absent"
         empty.mkdir()
         self.assertIsNone(subject.blocking_jobs(str(empty)))
-        self.assertEqual(subject.operator_release(str(empty), str(uuid.uuid4())), "unknown_job")
+        self.assertEqual(subject.operator_release(str(empty), str(uuid.uuid4())), "ledger_unavailable")
         self.assertEqual(list(empty.iterdir()), [])
 
     def test_dead_worker_job_is_released_and_stays_uncertain(self):
