@@ -20,6 +20,17 @@ import ai_team
 
 
 class EntryPointTests(unittest.TestCase):
+    def setUp(self):
+        # Never let an install test write to the real Codex configuration.
+        codex_home = tempfile.TemporaryDirectory()
+        self.addCleanup(codex_home.cleanup)
+        env_patch = patch.dict(os.environ, {"CODEX_HOME": codex_home.name})
+        env_patch.start()
+        self.addCleanup(env_patch.stop)
+        registry_patch = patch.object(ai_team, "codex_registry_available", return_value=True)
+        registry_patch.start()
+        self.addCleanup(registry_patch.stop)
+
     def test_default_state_directory_matches_user_home(self):
         with tempfile.TemporaryDirectory() as tmp:
             home_var = "USERPROFILE" if os.name == "nt" else "HOME"
@@ -532,6 +543,76 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(run.call_count, 1)
             self.assertTrue(Path(tmp, "codex-install-attempt.txt").exists())
 
+    def test_install_different_data_directories_still_registers_only_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+                 patch.object(ai_team.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, \
+                 patch("builtins.print"):
+                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "first"))]), 0)
+                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "second"))]), 1)
+            self.assertEqual(run.call_count, 1)
+            self.assertFalse(Path(tmp, "second", "codex-install-attempt.txt").exists())
+
+    def test_different_codex_homes_are_independent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+                 patch.object(ai_team.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, \
+                 patch("builtins.print"):
+                for index in (1, 2):
+                    with patch.dict(os.environ, {"CODEX_HOME": str(Path(tmp, f"codex-{index}"))}):
+                        self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, f"data-{index}"))]), 0)
+            self.assertEqual(run.call_count, 2)
+            homes = [call.kwargs["env"]["CODEX_HOME"] for call in run.call_args_list]
+            self.assertEqual(homes, [str(Path(tmp, "codex-1").resolve()), str(Path(tmp, "codex-2").resolve())])
+
+    def test_relative_codex_home_fails_before_registry_or_add(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {"CODEX_HOME": "relative-codex-home"}), \
+             patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+             patch.object(ai_team, "codex_registry_available", side_effect=AssertionError("must not query")), \
+             patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not add")), \
+             patch("builtins.print"):
+            self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "data"))]), 1)
+            self.assertFalse(Path(tmp, "data").exists())
+
+    def test_concurrent_install_different_directories_only_invokes_codex_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entered, finish = threading.Event(), threading.Event()
+            result = []
+            def run_once(*_args, **_kwargs):
+                entered.set()
+                if not finish.wait(5):
+                    raise TimeoutError("synthetic install did not finish")
+                return subprocess.CompletedProcess([], 0)
+            with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+                 patch.object(ai_team.subprocess, "run", side_effect=run_once) as run, \
+                 patch("builtins.print"):
+                first = threading.Thread(target=lambda: result.append(
+                    ai_team.main(["install", "--data-dir", str(Path(tmp, "first"))])))
+                first.start()
+                try:
+                    self.assertTrue(entered.wait(5))
+                    self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "second"))]), 1)
+                finally:
+                    finish.set()
+                    first.join(5)
+                self.assertFalse(first.is_alive())
+                self.assertEqual(result, [0])
+                self.assertEqual(run.call_count, 1)
+
+    def test_unreadable_registry_stops_and_retains_codex_home_marker(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with patch.object(ai_team, "codex_registry_available", return_value=False) as registry, \
+                 patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+                 patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not add")), \
+                 redirect_stderr(stderr):
+                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "first"))]), 1)
+                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "second"))]), 1)
+            self.assertEqual(registry.call_count, 1)
+            self.assertTrue(Path(os.environ["CODEX_HOME"], ".ai-collaboration-guide-install-attempt").is_file())
+            self.assertNotIn(tmp, stderr.getvalue())
+
     def test_real_mcp_stdio_with_missing_clients_stays_local(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = [sys.executable, "-B", str(Path(ai_team.__file__)), "serve",
@@ -542,6 +623,58 @@ class EntryPointTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0)
             result = json.loads(completed.stdout.strip())
             self.assertIn("tools", result["result"])
+
+
+class CodexRegistryTests(unittest.TestCase):
+    def test_official_json_array_is_checked_without_logging_existing_entries(self):
+        cases = [
+            (b'[]', True),
+            (b'[{"name":"other", "transport":{"type":"stdio"}}]', True),
+            (b'[{"name":"ai_team_legacy"}]', False),
+            (b'[{"name":"AI_TEAM_LEGACY"}]', False),
+            (b'[{"name":"ai_team"}]', False),
+            (b'[{"name":"other","name":"ai_team_legacy"}]', False),
+            (b'[{"name":null}]', False),
+            (b'{"name":"other"}', False),
+            (b'invalid synthetic sensitive details', False),
+            (b'\xff', False),
+            (b'x' * (1024 * 1024 + 1), False),
+        ]
+        for output, expected in cases:
+            with self.subTest(expected=expected, output_size=len(output)):
+                completed = subprocess.CompletedProcess([], 0, stdout=output)
+                with patch.object(ai_team.subprocess, "run", return_value=completed) as run, \
+                     redirect_stdout(io.StringIO()) as stdout, redirect_stderr(io.StringIO()) as stderr:
+                    self.assertEqual(ai_team.codex_registry_available("synthetic-codex", {"CODEX_HOME": "synthetic"}), expected)
+                self.assertEqual(run.call_args.args[0], ["synthetic-codex", "mcp", "list", "--json"])
+                self.assertEqual(run.call_args.kwargs["timeout"], 15)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_registry_nonzero_timeout_and_os_error_fail_closed(self):
+        failures = [subprocess.CompletedProcess([], 1, stdout=b'[]'),
+                    subprocess.TimeoutExpired("synthetic", 15), OSError("synthetic secret")]
+        for failure in failures:
+            with self.subTest(kind=type(failure).__name__), \
+                 patch.object(ai_team.subprocess, "run", side_effect=[failure]):
+                self.assertFalse(ai_team.codex_registry_available("synthetic-codex", {}))
+
+    def test_legacy_registration_stops_install_without_second_add(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            codex_home = Path(tmp, "codex-home")
+            codex_home.mkdir()
+            output = b'[{"name":"ai_team_legacy","transport":{"type":"stdio"}}]'
+            response = subprocess.CompletedProcess([], 0, stdout=output)
+            with patch.dict(os.environ, {"CODEX_HOME": str(codex_home)}), \
+                 patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+                 patch.object(ai_team.subprocess, "run", return_value=response) as run, \
+                 redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "data"))]), 1)
+            self.assertEqual(run.call_count, 1)
+            self.assertEqual(run.call_args.args[0][1:], ["mcp", "list", "--json"])
+            self.assertFalse(Path(tmp, "data").exists())
+            self.assertTrue(Path(codex_home, ".ai-collaboration-guide-install-attempt").is_file())
+            self.assertNotIn("ai_team_legacy", stderr.getvalue())
 
 
 if __name__ == "__main__":

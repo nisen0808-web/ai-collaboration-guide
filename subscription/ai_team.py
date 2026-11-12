@@ -45,6 +45,40 @@ def installation_executable(name: str) -> tuple[str, bool]:
     return name, False
 
 
+def codex_registry_available(cli: str, env: dict[str, str]) -> bool:
+    """Conservatively inspect existing registrations without exposing them."""
+    try:
+        completed = subprocess.run([cli, "mcp", "list", "--json"], env=env,
+                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL, timeout=15,
+                                   check=False, shell=False)
+        if completed.returncode != 0 or not isinstance(completed.stdout, bytes):
+            return False
+        if len(completed.stdout) > 1024 * 1024:
+            return False
+
+        def distinct_pairs(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError("duplicate key")
+                result[key] = value
+            return result
+
+        servers = json.loads(completed.stdout.decode("utf-8"), object_pairs_hook=distinct_pairs)
+        if not isinstance(servers, list):
+            return False
+        for server in servers:
+            if not isinstance(server, dict) or not isinstance(server.get("name"), str) or not server["name"]:
+                return False
+            name = server["name"].casefold()
+            if name == "ai_team" or name.startswith("ai_team_"):
+                return False
+        return True
+    except (OSError, ValueError, UnicodeError, subprocess.TimeoutExpired):
+        return False
+
+
 def build_adapters(args: argparse.Namespace) -> dict:
     """Prepare provider adapters without logging in or submitting tasks."""
     data = Path(args.data_dir).expanduser().resolve()
@@ -174,6 +208,33 @@ def main(argv: list[str] | None = None) -> int:
             if codex_cli is None:
                 print("Codex was not found. Install it or specify its path.", file=sys.stderr)
                 return 1
+            # A data-directory marker alone cannot guard attempts made with a
+            # different data directory. Reserve once per actual Codex home,
+            # and retain the reservation even when later steps are uncertain.
+            requested_home = os.environ.get("CODEX_HOME")
+            codex_home = Path(requested_home).expanduser() if requested_home else Path.home() / ".codex"
+            if not codex_home.is_absolute():
+                print("Codex home must be an absolute path. Check configuration before installing.", file=sys.stderr)
+                return 1
+            codex_home = codex_home.resolve()
+            codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
+            global_marker = codex_home / ".ai-collaboration-guide-install-attempt"
+            try:
+                global_fd = os.open(global_marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError:
+                print("A previous installation attempt exists. No server was added; "
+                      "check Codex and the installation markers before making changes.", file=sys.stderr)
+                return 1
+            with os.fdopen(global_fd, "w", encoding="utf-8") as stream:
+                stream.write("attempt\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            codex_env = os.environ.copy()
+            codex_env["CODEX_HOME"] = str(codex_home)
+            if not codex_registry_available(codex_cli, codex_env):
+                print("Could not safely verify existing Codex services. Check Codex before "
+                      "changing installation markers or trying again.", file=sys.stderr)
+                return 1
             # Reserve the installation attempt before invoking Codex. An
             # interrupted command may already have changed Codex, so a
             # subsequent invocation must not silently add another server.
@@ -210,7 +271,7 @@ def main(argv: list[str] | None = None) -> int:
                     command.extend((flag, value))
             completed = subprocess.run(command, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       check=False, shell=False)
+                                       check=False, shell=False, env=codex_env)
             if completed.returncode:
                 print("Could not confirm the MCP server was added. Check Codex before "
                       "removing the local installation marker or retrying.", file=sys.stderr)
