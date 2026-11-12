@@ -178,7 +178,7 @@ sys.exit(m.main(["--confirm-paid", "--stdin-utf8"]))
                "COLLAB_ANTHROPIC_KEY": "sk-ant-synthetic", "COLLAB_XAI_KEY": "xai-synthetic"}
         real_start, real_wait = threading.Thread.start, app._wait_for_workers
         started, release = threading.Event(), threading.Event()
-        starts, calls = [], []
+        starts, calls, first_started = [], [], []
 
         def provider(name, *_args):
             calls.append(name)
@@ -190,7 +190,7 @@ sys.exit(m.main(["--confirm-paid", "--stdin-utf8"]))
         def start(worker):
             starts.append(worker)
             if len(starts) == 2:
-                self.assertTrue(started.wait(3))
+                first_started.append(started.wait(3))
                 raise RuntimeError("private startup detail")
             real_start(worker)
 
@@ -210,6 +210,7 @@ sys.exit(m.main(["--confirm-paid", "--stdin-utf8"]))
             self.assertEqual(payload["providers"]["claude"]["output"], "first result")
             self.assertEqual(payload["providers"]["grok"]["status"], "submission_uncertain")
             self.assertEqual(calls, ["claude"])
+            self.assertEqual(first_started, [True])
             self.assertNotIn("private", out.getvalue())
             self.assertNotIn("synthetic", out.getvalue())
         finally:
@@ -222,7 +223,7 @@ sys.exit(m.main(["--confirm-paid", "--stdin-utf8"]))
                "COLLAB_ANTHROPIC_KEY": "sk-ant-synthetic", "COLLAB_XAI_KEY": "xai-synthetic"}
         real_start = threading.Thread.start
         started, release = threading.Event(), threading.Event()
-        starts = []
+        starts, first_started = [], []
 
         def provider(*_args):
             started.set()
@@ -232,7 +233,7 @@ sys.exit(m.main(["--confirm-paid", "--stdin-utf8"]))
         def start(worker):
             starts.append(worker)
             if len(starts) == 2:
-                self.assertTrue(started.wait(3))
+                first_started.append(started.wait(3))
                 raise RuntimeError("private")
             real_start(worker)
 
@@ -244,6 +245,7 @@ sys.exit(m.main(["--confirm-paid", "--stdin-utf8"]))
                  mock.patch.object(app, "_wait_for_workers", side_effect=KeyboardInterrupt), mock.patch("sys.stdout", out):
                 code = app.main(["--confirm-paid", "--stdin-utf8"])
             self.assertEqual(code, 130)
+            self.assertEqual(first_started, [True])
             self.assertEqual(json.loads(out.getvalue())["providers"]["claude"]["status"], "submission_uncertain")
             self.assertNotIn("private", out.getvalue())
         finally:
