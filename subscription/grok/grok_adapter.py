@@ -286,7 +286,7 @@ class GrokAdapter:
             saved = self._update(job_id, status="succeeded", phase="completed", error=None,
                                  output=data[:_MAX_RESULT_BYTES].decode("utf-8", errors="replace"),
                                  truncated=truncated, quality_verified=False, billing_verified=False,
-                                 quality_verification=pending)
+                                 quality_verification=pending, local_exit_confirmed=True)
             if saved is not True:
                 # If durable commit is not confirmed, retain the exact output
                 # file for reconciliation and never start optional collection.

@@ -1031,6 +1031,22 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         self.assertIs(result["local_exit_confirmed"], False)
         self.assertIs(result["inspection_metadata_unverified"], True)
 
+    def test_successful_grok_exit_is_visible_and_not_restarted(self):
+        class Adapter:
+            def __init__(self): self.calls = 0
+            def submit(self, **kw):
+                self.calls += 1
+                return {"status": "queued", "job_id": "job-1"}
+            def poll(self, job_id):
+                return {"status": "succeeded", "output": "synthetic", "truncated": False,
+                        "local_exit_confirmed": True}
+        adapter = Adapter()
+        coordinator = Coordinator(self.db, {"grok": adapter})
+        coordinator.submit("grok", "synthetic", "key")
+        self.assertIs(coordinator.result("grok", "key")["local_exit_confirmed"], True)
+        self.assertIs(coordinator.result("grok", "key")["local_exit_confirmed"], True)
+        self.assertEqual(adapter.calls, 1)
+
     def test_operator_release_does_not_claim_observed_exit(self):
         class Adapter:
             def submit(self, **kw): return {"status": "queued", "job_id": "job-1"}

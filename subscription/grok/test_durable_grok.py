@@ -481,7 +481,7 @@ class DurableTests(unittest.TestCase):
         self.assertFalse(adapter.ledger.store(first, {"job_id": first, "status": "running"}))
         pending = {"client_evidence_status": "pending"}
         initial = {"job_id": first, "status": "succeeded", "output": "synthetic answer",
-                   "quality_verification": pending}
+                   "local_exit_confirmed": True, "quality_verification": pending}
         self.assertTrue(adapter.ledger.store(first, initial))
         self.assertFalse(adapter.ledger.store(first, {"job_id": first, "status": "failed"}))
         self.assertFalse(adapter.ledger.store(first, {**initial, "output": "changed"}))
