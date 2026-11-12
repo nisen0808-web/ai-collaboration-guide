@@ -159,9 +159,12 @@ class GrokAdapter:
                 "local_available_slots": self.max_concurrency - active,
                 "official_quota_verified": False, "login_verified": False}
 
-    def _update(self, job_id: str, **fields) -> None:
+    def _update(self, job_id: str, **fields) -> bool:
         with self._lock:
             self._jobs[job_id].update(fields)
+        # In-memory callers have no separate persistent ledger. The durable
+        # worker overrides this method and returns True only after DB commit.
+        return True
 
     def _execute(self, job_id: str, task: str) -> None:
         work: Path | None = None
@@ -270,10 +273,15 @@ class GrokAdapter:
                        "client_model_matches_requested": None, "client_effort_matches_requested": None,
                        "observed_model": None, "observed_effort": None,
                        "evidence_source": "official_grok_client_session", "server_effort_verified": False}
-            self._update(job_id, status="succeeded", phase="completed", error=None,
-                         output=data[:_MAX_RESULT_BYTES].decode("utf-8", errors="replace"),
-                         truncated=truncated, quality_verified=False, billing_verified=False,
-                         quality_verification=pending)
+            saved = self._update(job_id, status="succeeded", phase="completed", error=None,
+                                 output=data[:_MAX_RESULT_BYTES].decode("utf-8", errors="replace"),
+                                 truncated=truncated, quality_verified=False, billing_verified=False,
+                                 quality_verification=pending)
+            if saved is not True:
+                # If durable commit is not confirmed, retain the exact output
+                # file for reconciliation and never start optional collection.
+                preserve_output = True
+                return
             if evidence_preflight and not truncated:
                 try:
                     evidence = session_evidence.collect(str(self.profile), str(work), job_id, self.model, self.effort,

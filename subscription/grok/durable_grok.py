@@ -190,7 +190,17 @@ class _Ledger:
                                    "dispatching", "submission_uncertain")).rowcount
             return changed == 1
 
-    def store(self, job_id: str, state: dict) -> None:
+    def store(self, job_id: str, state: dict) -> bool:
+        """Commit an update to its bound job; never overwrite a terminal result.
+
+        A successful result may be enriched once with evidence after its
+        answer has been committed. False means nothing was committed; storage
+        exceptions propagate so a worker can preserve its output and continue
+        conservatively without resubmitting.
+        """
+        if (not _valid_id(job_id) or not isinstance(state, dict) or state.get("job_id") != job_id or
+                state.get("status") not in ("queued", "running", "succeeded", "failed", "submission_uncertain")):
+            return False
         # Store full results only under user-selected state_root, never stdout.
         text = json.dumps(state, ensure_ascii=True)
         # The remote outcome can remain unknown even after the direct local
@@ -199,8 +209,47 @@ class _Ledger:
         durable_state = ("finished_uncertain" if state.get("status") == "submission_uncertain"
                          and state.get("local_exit_confirmed") is True else state["status"])
         with self._connect() as con:
-            con.execute("UPDATE jobs SET state=?, result_json=? WHERE job_id=?",
-                        (durable_state, text, job_id))
+            con.execute("BEGIN IMMEDIATE")
+            row = con.execute("SELECT state,worker_pid,worker_identity,result_json FROM jobs WHERE job_id=?",
+                              (job_id,)).fetchone()
+            if row is None:
+                return False
+            try:
+                previous = json.loads(row["result_json"])
+            except (ValueError, TypeError):
+                return False
+            if not _consistent_record(job_id, row["state"], row["worker_pid"], row["worker_identity"], previous):
+                return False
+            old_state = row["state"]
+            if old_state in ("failed", "finished_uncertain", _PRELAUNCH_ABORTED, "not_submitted"):
+                return False
+            if old_state == "succeeded":
+                if durable_state != "succeeded":
+                    return False
+                before, after = dict(previous), dict(state)
+                old_quality = before.pop("quality_verification", None)
+                new_quality = after.pop("quality_verification", None)
+                if before != after:
+                    return False
+                if old_quality != new_quality:
+                    if (not isinstance(old_quality, dict) or old_quality.get("client_evidence_status") != "pending" or
+                            not isinstance(new_quality, dict) or
+                            new_quality.get("client_evidence_status") not in ("matched", "mismatch", "unavailable")):
+                        return False
+            else:
+                transitions = {
+                    "dispatching": {"queued", "running", "succeeded", "failed", "submission_uncertain", "finished_uncertain"},
+                    "queued": {"queued", "running", "succeeded", "failed", "submission_uncertain", "finished_uncertain"},
+                    "running": {"running", "succeeded", "failed", "submission_uncertain", "finished_uncertain"},
+                    "submission_uncertain": {"submission_uncertain", "finished_uncertain", "succeeded"},
+                }
+                if durable_state not in transitions.get(old_state, set()):
+                    return False
+            # Bind update to the same previously read state and body. The
+            # surrounding transaction commits before this method returns True.
+            changed = con.execute("UPDATE jobs SET state=?, result_json=? WHERE job_id=? AND state=? AND result_json=?",
+                                  (durable_state, text, job_id, old_state, row["result_json"])).rowcount
+        return changed == 1
 
     def mark_start_uncertain_if_unclaimed(self, job_id: str) -> None:
         state = {"status": "submission_uncertain", "job_id": job_id,
@@ -482,14 +531,15 @@ def worker_main(root: str, job_id: str) -> int:
     adapter._active_job_ids.add(job_id)
     original_update = adapter._update
 
-    def persist_update(current_id: str, **fields) -> None:
-        original_update(current_id, **fields)
+    def persist_update(current_id: str, **fields) -> bool:
         try:
-            ledger.store(current_id, adapter.poll(current_id))
-        except (OSError, sqlite3.Error, ValueError, TypeError):
+            if original_update(current_id, **fields) is not True:
+                return False
+            return ledger.store(current_id, adapter.poll(current_id)) is True
+        except Exception:
             # A metadata-write problem must not kill a live child. Polling
             # remains conservative until a later update can be persisted.
-            pass
+            return False
 
     adapter._update = persist_update
     # The CLI prompt/output files are created inside this tool-owned job folder,

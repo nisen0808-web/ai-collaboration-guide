@@ -168,6 +168,38 @@ class WindowsSyntheticFilesTests(unittest.TestCase):
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.assertEqual(p.returncode, 0)
 
+    def acl_change(self, path, *arguments):
+        """Modify ACLs only on a path created inside this test's temp root."""
+        logical = Path(str(path)[4:]) if str(path).startswith("\\\\?\\") else path
+        self.assertTrue(logical.is_relative_to(self.root))
+        p = subprocess.run(["icacls.exe", str(path), *arguments],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           shell=False)
+        self.assertEqual(p.returncode, 0, "synthetic ACL operation failed")
+
+    def acl_is_protected(self, path):
+        """Inspect only this synthetic directory's DACL protection bit."""
+        import ctypes
+        from ctypes import wintypes
+        from claude import win_private_acl as acl, win_session_handle as handles
+        self.assertTrue(path.is_relative_to(self.root))
+        handle, _ = handles._open(path, directory=True)
+        descriptor, owner, dacl = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        try:
+            status = acl._adv.GetSecurityInfo(handle, 1, 0x1 | 0x4, ctypes.byref(owner),
+                                             None, ctypes.byref(dacl), None,
+                                             ctypes.byref(descriptor))
+            self.assertEqual(status, 0)
+            self.assertTrue(descriptor.value)
+            control, revision = wintypes.WORD(), wintypes.DWORD()
+            self.assertTrue(acl._adv.GetSecurityDescriptorControl(
+                descriptor, ctypes.byref(control), ctypes.byref(revision)))
+            return bool(control.value & 0x1000)
+        finally:
+            if descriptor.value:
+                acl._kernel.LocalFree(descriptor)
+            self.assertTrue(handles._kernel.CloseHandle(handle))
+
     def create_records(self):
         self.session_dir.mkdir(parents=True)
         for path in (self.profile / "sessions", self.parent, self.session_dir):
@@ -210,6 +242,50 @@ class WindowsSyntheticFilesTests(unittest.TestCase):
         out = evidence.collect(str(self.profile), str(self.work), self.session, "grok-4.7", "xhigh",
                                preflight_ok=True, process_exit_confirmed=True)
         self.assertEqual(out["client_evidence_status"], "unavailable")
+
+    def test_profile_broad_read_ace_blocks_preflight_and_restores(self):
+        # Well-known SIDs work irrespective of Windows display language.
+        for sid in ("S-1-1-0", "S-1-5-32-545"):  # Everyone, Users
+            with self.subTest(principal="everyone" if sid == "S-1-1-0" else "users"):
+                self.assertTrue(evidence.preflight(str(self.profile), str(self.work), self.session))
+                try:
+                    self.acl_change(self.profile, "/grant:r", "*" + sid + ":(RX)")
+                    self.assertFalse(evidence.preflight(str(self.profile), str(self.work), self.session))
+                    self.assertTrue(self.profile.is_dir())
+                finally:
+                    self.acl_change(self.profile, "/remove:g", "*" + sid)
+                self.assertTrue(evidence.preflight(str(self.profile), str(self.work), self.session))
+
+    def test_profile_unprotected_inheritance_blocks_preflight_and_restores(self):
+        self.assertTrue(self.acl_is_protected(self.profile))
+        self.assertTrue(evidence.preflight(str(self.profile), str(self.work), self.session))
+        try:
+            self.acl_change(self.profile, "/inheritance:e")
+            self.assertFalse(self.acl_is_protected(self.profile))
+            self.assertFalse(evidence.preflight(str(self.profile), str(self.work), self.session))
+            self.assertTrue(self.profile.is_dir())
+        finally:
+            self.acl_change(self.profile, "/inheritance:r")
+        self.assertTrue(self.acl_is_protected(self.profile))
+        self.assertTrue(evidence.preflight(str(self.profile), str(self.work), self.session))
+
+    def test_metadata_broad_read_ace_blocks_collection_without_deleting(self):
+        self.assertTrue(evidence.preflight(str(self.profile), str(self.work), self.session))
+        self.create_records()
+        target = self.session_dir / "summary.json"
+        usage = self.session_dir / "usage.json"
+        try:
+            self.acl_change(target, "/grant:r", "*S-1-1-0:(RX)")
+            out = evidence.collect(str(self.profile), str(self.work), self.session, "grok-4.7", "xhigh",
+                                   preflight_ok=True, process_exit_confirmed=True)
+            self.assertEqual(out["client_evidence_status"], "unavailable")
+            self.assertTrue(target.exists()); self.assertTrue(usage.exists())
+        finally:
+            self.acl_change(target, "/remove:g", "*S-1-1-0")
+        out = evidence.collect(str(self.profile), str(self.work), self.session, "grok-4.7", "xhigh",
+                               preflight_ok=True, process_exit_confirmed=True)
+        self.assertEqual(out["client_evidence_status"], "matched")
+        self.assertTrue(target.exists()); self.assertTrue(usage.exists())
 
     def test_long_windows_path_uses_extended_handles(self):
         # Keep the work path under 255 encoded bytes while forcing the final

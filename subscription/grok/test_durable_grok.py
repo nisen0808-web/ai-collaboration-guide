@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -314,8 +315,17 @@ class DurableTests(unittest.TestCase):
                     self.assertEqual(replay["job_id"], job_id)
                     self.assertEqual(adapter.submit("different task", "task-2")["reason"], "provider_busy")
                     self.assertEqual(launch.call_count, 1)
-            # A consistent, genuine terminal state is unaffected.
-            adapter.ledger.store(job_id, {"status": "succeeded", "job_id": job_id, "output": "valid"})
+            # A corrupt record cannot be replaced by an unrelated result.
+            self.assertFalse(adapter.ledger.store(job_id, {"status": "succeeded", "job_id": job_id, "output": "valid"}))
+            self.assertEqual(adapter.poll(job_id)["status"], "submission_uncertain")
+            # Restore a valid synthetic reservation to exercise the genuine
+            # claimed-worker transition, rather than repairing corruption.
+            with adapter.ledger._connect() as con:
+                con.execute("UPDATE jobs SET state='dispatching',worker_pid=NULL,worker_identity=NULL,result_json=? WHERE job_id=?",
+                            (json.dumps({"status": "submission_uncertain", "job_id": job_id,
+                                         "error": "worker_start_unconfirmed"}), job_id))
+            self.assertTrue(adapter.ledger.claim(job_id))
+            self.assertTrue(adapter.ledger.store(job_id, {"status": "succeeded", "job_id": job_id, "output": "valid"}))
             self.assertEqual(adapter.poll(job_id)["output"], "valid")
             self.assertEqual(adapter.status()["local_available_slots"], 1)
 
@@ -424,6 +434,159 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(state["quality_verification"]["client_evidence_status"], "unavailable")
         self.assertNotIn("synthetic evidence failure", repr(state))
         self.assertEqual(adapter.submit("synthetic task", "evidence-order")["reason"], "already_submitted")
+        self.assertEqual(launch.call_count, 1)
+
+    def test_store_checks_job_and_never_overwrites_terminal_result(self):
+        adapter = self.adapter(max_concurrency=2)
+        _, first = adapter.ledger.reserve("task-a", "digest-a", 2)
+        _, second = adapter.ledger.reserve("task-b", "digest-b", 2)
+        self.assertTrue(adapter.ledger.claim(first))
+        self.assertTrue(adapter.ledger.claim(second))
+        before_second = adapter.ledger.get(second)
+        self.assertFalse(adapter.ledger.store(first, {"job_id": second, "status": "succeeded", "output": "wrong"}))
+        self.assertEqual(adapter.ledger.get(second), before_second)
+        self.assertTrue(adapter.ledger.store(first, {"job_id": first, "status": "running"}))
+        self.assertFalse(adapter.ledger.store(first, {"job_id": first, "status": "queued"}))
+        self.assertTrue(adapter.ledger.store(first, {"job_id": first, "status": "submission_uncertain"}))
+        self.assertFalse(adapter.ledger.store(first, {"job_id": first, "status": "running"}))
+        pending = {"client_evidence_status": "pending"}
+        initial = {"job_id": first, "status": "succeeded", "output": "synthetic answer",
+                   "quality_verification": pending}
+        self.assertTrue(adapter.ledger.store(first, initial))
+        self.assertFalse(adapter.ledger.store(first, {"job_id": first, "status": "failed"}))
+        self.assertFalse(adapter.ledger.store(first, {**initial, "output": "changed"}))
+        final = {**initial, "quality_verification": {"client_evidence_status": "matched"}}
+        self.assertTrue(adapter.ledger.store(first, final))
+        self.assertFalse(adapter.ledger.store(first, initial))
+        self.assertEqual(adapter.ledger.get(first).result, final)
+        self.assertEqual(adapter.ledger.get(second), before_second)
+        self.assertFalse(adapter.ledger.store("00000000-0000-4000-8000-000000000000",
+                                              {"job_id": "00000000-0000-4000-8000-000000000000", "status": "running"}))
+
+    def test_store_true_requires_successful_sqlite_commit(self):
+        adapter = self.adapter()
+        _, job_id = adapter.ledger.reserve("task-a", "digest-a", 1)
+        self.assertTrue(adapter.ledger.claim(job_id))
+        before = adapter.ledger.get(job_id)
+        real_connect = sqlite3.connect
+        class CommitFails(sqlite3.Connection):
+            def commit(self):
+                raise sqlite3.OperationalError("synthetic commit failure")
+        def fail_connection(*args, **kwargs):
+            return real_connect(*args, factory=CommitFails, **kwargs)
+        with mock.patch.object(subject.sqlite3, "connect", side_effect=fail_connection):
+            with self.assertRaises(sqlite3.OperationalError):
+                adapter.ledger.store(job_id, {"job_id": job_id, "status": "succeeded", "output": "synthetic"})
+        self.assertEqual(adapter.ledger.get(job_id), before)
+        self.assertTrue(adapter.ledger.store(job_id, {"job_id": job_id, "status": "succeeded", "output": "synthetic"}))
+
+    def test_store_reports_false_when_sqlite_updates_zero_rows(self):
+        adapter = self.adapter()
+        _, job_id = adapter.ledger.reserve("task-a", "digest-a", 1)
+        self.assertTrue(adapter.ledger.claim(job_id))
+        before = adapter.ledger.get(job_id)
+        with adapter.ledger._connect() as con:
+            con.execute("CREATE TRIGGER synthetic_skip_update BEFORE UPDATE ON jobs "
+                        "WHEN NEW.state='succeeded' BEGIN SELECT RAISE(IGNORE); END")
+        self.assertFalse(adapter.ledger.store(job_id, {"job_id": job_id, "status": "succeeded", "output": "synthetic"}))
+        self.assertEqual(adapter.ledger.get(job_id), before)
+        with adapter.ledger._connect() as con:
+            con.execute("DROP TRIGGER synthetic_skip_update")
+        self.assertTrue(adapter.ledger.store(job_id, {"job_id": job_id, "status": "succeeded", "output": "synthetic"}))
+
+    def test_uncommitted_terminal_answer_is_retained_without_collect_or_replay(self):
+        grok_module = sys.modules[subject.GrokAdapter.__module__]
+        report = {name: [] for name in grok_module._INSPECT_KEYS}
+        real_connect = sqlite3.connect
+        for mode in ("first", "persistent"):
+            with self.subTest(mode=mode):
+                root = self.base / ("state-" + mode)
+                root.mkdir()
+                adapter = subject.DurableGrokAdapter(str(self.cli), "example-model", "high", str(self.profile), str(root), 2, 1)
+                with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)) as launch:
+                    receipt = adapter.submit("synthetic task", "key-" + mode)
+                job_id = receipt["job_id"]
+                attempts = []
+                class FailingTerminalCommit(sqlite3.Connection):
+                    fail_current = False
+                    def execute(self, sql, parameters=()):
+                        result = super().execute(sql, parameters)
+                        if sql.startswith("UPDATE jobs SET state=?, result_json=? WHERE job_id=? AND state=?") and parameters[0] == "succeeded":
+                            self.fail_current = True
+                        return result
+                    def commit(self):
+                        if self.fail_current:
+                            attempts.append("terminal")
+                            if mode == "persistent" or len(attempts) == 1:
+                                raise sqlite3.OperationalError("synthetic commit failure")
+                        return super().commit()
+                def fail_terminal(*args, **kwargs):
+                    return real_connect(*args, factory=FailingTerminalCommit, **kwargs)
+                class Child:
+                    def __init__(self, argv, **kwargs):
+                        kwargs["stdout"].write(b"synthetic answer")
+                        kwargs["stdout"].flush()
+                    def wait(self, timeout=None):
+                        return 0
+                with mock.patch.object(subject.sqlite3, "connect", side_effect=fail_terminal), \
+                     mock.patch.object(grok_module.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(report).encode())), \
+                     mock.patch.object(grok_module.subprocess, "Popen", side_effect=Child), \
+                     mock.patch.object(grok_module.session_evidence, "preflight", return_value=True), \
+                     mock.patch.object(grok_module.session_evidence, "collect") as collect:
+                    self.assertEqual(subject.worker_main(str(root), job_id), 0)
+                collect.assert_not_called()
+                self.assertEqual(attempts, ["terminal"])
+                retained = list((root / "grok-jobs" / job_id).glob("grok-collab-*/output.txt"))
+                self.assertEqual(len(retained), 1)
+                self.assertEqual(retained[0].read_bytes(), b"synthetic answer")
+                self.assertNotEqual(adapter.poll(job_id)["status"], "succeeded")
+                replay = adapter.submit("synthetic task", "key-" + mode)
+                self.assertEqual(replay["job_id"], job_id)
+                self.assertTrue(replay["replayed"])
+                self.assertEqual(launch.call_count, 1)
+
+    def test_evidence_commit_failure_keeps_committed_answer(self):
+        adapter = self.adapter()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)) as launch:
+            receipt = adapter.submit("synthetic task", "evidence-commit-failure")
+        job_id = receipt["job_id"]
+        grok_module = sys.modules[subject.GrokAdapter.__module__]
+        report = {name: [] for name in grok_module._INSPECT_KEYS}
+        real_connect = sqlite3.connect
+        attempts = []
+        class FailingEvidenceCommit(sqlite3.Connection):
+            fail_current = False
+            def execute(self, sql, parameters=()):
+                result = super().execute(sql, parameters)
+                if sql.startswith("UPDATE jobs SET state=?, result_json=? WHERE job_id=? AND state=?") and parameters[0] == "succeeded":
+                    body = json.loads(parameters[1])
+                    self.fail_current = body.get("quality_verification", {}).get("client_evidence_status") == "matched"
+                return result
+            def commit(self):
+                if self.fail_current:
+                    attempts.append("evidence")
+                    raise sqlite3.OperationalError("synthetic evidence commit failure")
+                return super().commit()
+        def fail_evidence(*args, **kwargs):
+            return real_connect(*args, factory=FailingEvidenceCommit, **kwargs)
+        class Child:
+            def __init__(self, argv, **kwargs):
+                kwargs["stdout"].write(b"synthetic answer")
+                kwargs["stdout"].flush()
+            def wait(self, timeout=None):
+                return 0
+        with mock.patch.object(subject.sqlite3, "connect", side_effect=fail_evidence), \
+             mock.patch.object(grok_module.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(report).encode())), \
+             mock.patch.object(grok_module.subprocess, "Popen", side_effect=Child), \
+             mock.patch.object(grok_module.session_evidence, "preflight", return_value=True), \
+             mock.patch.object(grok_module.session_evidence, "collect", return_value={"client_evidence_status": "matched"}):
+            self.assertEqual(subject.worker_main(str(self.root), job_id), 0)
+        self.assertEqual(attempts, ["evidence"])
+        state = self.adapter().poll(job_id)
+        self.assertEqual(state["status"], "succeeded")
+        self.assertEqual(state["output"], "synthetic answer")
+        self.assertEqual(state["quality_verification"]["client_evidence_status"], "pending")
+        self.assertEqual(adapter.submit("synthetic task", "evidence-commit-failure")["reason"], "already_submitted")
         self.assertEqual(launch.call_count, 1)
 
     def test_worker_survives_actual_launcher_exit_then_new_adapter_polls(self):
