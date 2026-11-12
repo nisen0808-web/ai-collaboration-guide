@@ -313,8 +313,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except Exception:
         # Do not echo local paths, credentials, or exception text in MCP logs.
-        message = ("Unable to check local prerequisites. Check your Codex home and permissions."
-                   if args.mode == "setup-check" else "Unable to start the local collaboration service.")
+        message = {
+            "setup-check": "Unable to check local prerequisites. Check your Codex home and permissions.",
+            "install": "Unable to complete installation. Check Codex and the installation markers before trying again.",
+            "login": "Unable to prepare official login. Check local configuration or permissions.",
+        }.get(args.mode, "Unable to start the local collaboration service.")
         print(message, file=sys.stderr)
         return 1
 

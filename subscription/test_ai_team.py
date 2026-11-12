@@ -613,6 +613,14 @@ class EntryPointTests(unittest.TestCase):
             self.assertTrue(Path(os.environ["CODEX_HOME"], ".ai-collaboration-guide-install-attempt").is_file())
             self.assertNotIn(tmp, stderr.getvalue())
 
+    def test_unexpected_install_error_reports_installation_without_details(self):
+        stderr = io.StringIO()
+        with patch.object(ai_team, "executable", side_effect=OSError("synthetic private path")), \
+             redirect_stderr(stderr):
+            self.assertEqual(ai_team.main(["install"]), 1)
+        self.assertIn("Unable to complete installation", stderr.getvalue())
+        self.assertNotIn("synthetic private path", stderr.getvalue())
+
     def test_real_mcp_stdio_with_missing_clients_stays_local(self):
         with tempfile.TemporaryDirectory() as tmp:
             command = [sys.executable, "-B", str(Path(ai_team.__file__)), "serve",
