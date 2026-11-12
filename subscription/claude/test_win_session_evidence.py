@@ -21,7 +21,9 @@ class WindowsSessionEvidenceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="session-evidence-test-")
         self.addCleanup(self.temp.cleanup)
-        base = Path(self.temp.name)
+        # Windows runners can expose TEMP using a DOS 8.3 alias. Use the
+        # canonical paths required by the session-evidence preflight.
+        base = Path(self.temp.name).resolve()
         self.profile = base / "profile"
         self.work = base / "work"
         self.profile.mkdir()
@@ -45,8 +47,68 @@ class WindowsSessionEvidenceTests(unittest.TestCase):
         self.target = self.project / (self.session + ".jsonl")
         self.other = self.project / (str(uuid.uuid4()) + ".jsonl")
 
+    def _fixture_diagnostics(self):
+        """Only fixed booleans/categories; never emit paths, ACLs or SIDs."""
+        import ctypes
+        from ctypes import wintypes
+        import win_session_handle as handles
+        import win_private_acl as acl
+        checks = {}
+
+        def owner_is_current_user(handle):
+            token = wintypes.HANDLE()
+            descriptor = ctypes.c_void_p()
+            try:
+                if not acl._adv.OpenProcessToken(acl._kernel.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+                    return None
+                needed = wintypes.DWORD()
+                acl._adv.GetTokenInformation(token, 1, None, 0, ctypes.byref(needed))
+                if not 0 < needed.value <= 1_000_000:
+                    return None
+                token_data = ctypes.create_string_buffer(needed.value)
+                if not acl._adv.GetTokenInformation(token, 1, token_data, needed.value, ctypes.byref(needed)):
+                    return None
+                user_sid = ctypes.cast(token_data, ctypes.POINTER(ctypes.c_void_p)).contents.value
+                owner = ctypes.c_void_p()
+                if acl._adv.GetSecurityInfo(handle, 1, 1, ctypes.byref(owner), None, None, None,
+                                            ctypes.byref(descriptor)) != 0:
+                    return None
+                if not owner.value or not user_sid:
+                    return None
+                return bool(acl._adv.EqualSid(owner, ctypes.c_void_p(user_sid)))
+            except Exception:
+                return None
+            finally:
+                if descriptor.value:
+                    acl._kernel.LocalFree(descriptor)
+                if token.value:
+                    acl._kernel.CloseHandle(token)
+        try:
+            checks["canonical_work"] = os.path.normcase(str(self.work.resolve(strict=True))) == os.path.normcase(str(self.work))
+        except OSError:
+            checks["canonical_work"] = False
+        paths = (("profile", self.profile, True), ("work", self.work, True),
+                 ("projects", self.profile / "projects", False), ("project", self.project, False))
+        for label, path, protected in paths:
+            opened = []
+            checks[label + "_chain"] = False
+            checks[label + "_acl"] = False
+            checks[label + "_owner_current_user"] = None
+            try:
+                handle = evidence._hold_chain(path, handles, opened)
+                checks[label + "_chain"] = True
+                checks[label + "_owner_current_user"] = owner_is_current_user(handle)
+                checks[label + "_acl"] = acl.protected_private_acl(handle,
+                    require_protected=protected, allow_inherited=not protected)
+            except Exception:
+                pass
+            finally:
+                checks[label + "_closed"] = evidence._close(handles, opened)
+        return checks
+
     def test_preflight_bound_session_cleanup_does_not_touch_other_file(self):
-        self.assertTrue(evidence.prepare_session_evidence(str(self.profile), str(self.work), self.session, enabled=True))
+        if not evidence.prepare_session_evidence(str(self.profile), str(self.work), self.session, enabled=True):
+            self.fail(json.dumps(self._fixture_diagnostics(), sort_keys=True))
         self.target.write_text(json.dumps({"type": "assistant", "sessionId": self.session,
             "message": {"model": "claude-synthetic", "content": "synthetic-secret"},
             "effort": "medium"}) + "\n", encoding="utf-8")
