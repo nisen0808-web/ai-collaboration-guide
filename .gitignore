@@ -1,0 +1,10 @@
+# Local examples and state; this does not protect already tracked files.
+task.txt
+.env
+.env.*
+.venv/
+__pycache__/
+*.py[cod]
+*.sqlite*
+*.db
+*.log

@@ -30,7 +30,7 @@ SUBMIT_REASONS = frozenset({
     "provider_busy", "invalid_task", "invalid_task_id", "cli_or_profile_unavailable",
     "task_id_conflict", "worker_unavailable", "already_submitted",
     "state_unavailable", "state_write_failed", "dispatch_interrupted", "session_evidence_unavailable",
-    "session_evidence_model_invalid",
+    "session_evidence_model_invalid", "worker_start_unconfirmed",
 })
 POLL_ERRORS = frozenset({
     "login_required", "provider_busy", "provider_error", "adapter_error", "timed_out",
@@ -44,6 +44,12 @@ POLL_ERRORS = frozenset({
     "session_evidence_unavailable",
     "worker_identity_unconfirmed", "worker_start_unconfirmed",
     "worker_request_invalid", "dispatch_interrupted", "state_write_failed",
+    "operator_released",
+})
+# Startup diagnostics supplied by the trusted entry point, never by a provider.
+SETUP_ISSUES = frozenset({
+    "cli_not_found", "invalid_configuration", "local_state_unavailable",
+    "session_evidence_model_invalid",
 })
 INSPECTION_REASONS = frozenset({
     "inspection_format_unknown", "extensions_present_or_unknown",
@@ -136,7 +142,8 @@ class Coordinator:
     """
 
     def __init__(self, db_path: str | Path, adapters: dict[str, Any] | None = None, *, status_timeout: float = 1.5,
-                 unconfigured_providers: tuple[str, ...] = ()):
+                 unconfigured_providers: tuple[str, ...] = (),
+                 setup_issues: dict[str, str] | None = None):
         self.path = str(db_path)
         self.adapters = dict(adapters or {})
         self.status_timeout = max(0.0, min(float(status_timeout), 5.0))
@@ -144,6 +151,9 @@ class Coordinator:
         # In particular, a read-only historical ledger must remain visibly
         # disabled even if its status probe blocks on an existing DB lock.
         self._unconfigured_providers = frozenset(unconfigured_providers) & {"claude", "grok"}
+        # Why a provider did not start: one fixed code each, set at startup.
+        self._setup_issues = {name: code for name, code in dict(setup_issues or {}).items()
+                              if name in ("claude", "grok") and isinstance(code, str) and code in SETUP_ISSUES}
         self._status_slots = {name: threading.BoundedSemaphore(1) for name in ("claude", "grok")}
         self._initialise()
 
@@ -180,6 +190,8 @@ class Coordinator:
                          "ready": None if name in self.adapters and name not in self._unconfigured_providers else False,
                          "verification": "not_verified"}
                   for name in ("claude", "grok")}
+        for name, code in self._setup_issues.items():
+            values[name]["setup_issue"] = code
         finished = {}
         observations = {}
         for name in ("claude", "grok"):
@@ -397,6 +409,9 @@ class Coordinator:
         if type(response.get("local_exit_confirmed")) is bool:
             # Local exit is not proof of the remote result or non-submission.
             result["local_exit_confirmed"] = response["local_exit_confirmed"]
+        if response.get("error") == "operator_released" and response.get("release_basis") == "operator_confirmed":
+            # A user assertion must not be represented as observed process exit.
+            result["release_basis"] = "operator_confirmed"
         if type(response.get("inspection_metadata_unverified")) is bool:
             result["inspection_metadata_unverified"] = response["inspection_metadata_unverified"]
         error = response.get("error")

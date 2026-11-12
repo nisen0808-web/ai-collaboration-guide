@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -87,6 +88,50 @@ def _process_identity(pid: int) -> str | None:
         return None  # Unsupported platforms never claim worker liveness.
 
 
+def _worker_identity_state(pid, identity) -> str:
+    """Distinguish a bound, observed exit from inaccessible/unknown identity."""
+    if type(pid) is not int or pid <= 0 or not isinstance(identity, str):
+        return "unknown"
+    identity_pattern = (rf"{pid}:\d+:\d+" if os.name == "nt" else
+                        rf"{pid}:\d+" if sys.platform.startswith("linux") else None)
+    if identity_pattern is None or not re.fullmatch(identity_pattern, identity):
+        return "unknown"
+    try:
+        current = _process_identity(pid)
+    except (OSError, ValueError):
+        return "unknown"
+    if current is not None:
+        return "running" if current == identity else "exited"
+    if os.name == "nt":
+        from ctypes import wintypes
+        import ctypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            # ERROR_INVALID_PARAMETER means the PID does not exist. Access
+            # denied and every other failure are not proof of process exit.
+            return "exited" if ctypes.get_last_error() == 87 else "unknown"
+        try:
+            code = wintypes.DWORD()
+            if kernel.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:
+                return "exited"
+            return "unknown"
+        finally:
+            kernel.CloseHandle(handle)
+    if sys.platform.startswith("linux"):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "exited"
+        except (OSError, ValueError):
+            pass
+    return "unknown"
+
+
 @dataclass(frozen=True)
 class _StoredJob:
     job_id: str
@@ -120,6 +165,10 @@ def _consistent_record(job_id: str, state: str, worker_pid: int | None,
         return status == state
     if state == "finished_uncertain":
         return status == "submission_uncertain" and result.get("local_exit_confirmed") is True
+    if state == "operator_released":
+        return (status == "submission_uncertain" and result.get("error") == "operator_released"
+                and result.get("release_basis") == "operator_confirmed"
+                and result.get("local_exit_confirmed") is False)
     return state in _TERMINAL and status == state
 
 
@@ -221,7 +270,7 @@ class _Ledger:
             if not _consistent_record(job_id, row["state"], row["worker_pid"], row["worker_identity"], previous):
                 return False
             old_state = row["state"]
-            if old_state in ("failed", "finished_uncertain", _PRELAUNCH_ABORTED, "not_submitted"):
+            if old_state in ("failed", "finished_uncertain", "operator_released", _PRELAUNCH_ABORTED, "not_submitted"):
                 return False
             if old_state == "succeeded":
                 if durable_state != "succeeded":
@@ -316,6 +365,55 @@ class _Ledger:
                 active.append(row)
         return active
 
+    def _worker_state(self, row: sqlite3.Row) -> str:
+        return _worker_identity_state(row["worker_pid"], row["worker_identity"])
+
+    def blocking(self) -> list[dict]:
+        """Read-only list of rows that occupy a local slot."""
+        with self._connect() as con:
+            rows = self._active_rows(con)
+        return [{"job_id": row["job_id"], "state": row["state"],
+                 "worker_state": self._worker_state(row)} for row in rows]
+
+    def operator_release(self, job_id: str) -> str:
+        """Free one slot after the user confirmed the client process exited.
+
+        The remote outcome stays unknown and is never resubmitted. The caller
+        must separately confirm the client exited; only a bound worker whose
+        original process is independently known to have exited can be released.
+        """
+        if not _valid_id(job_id):
+            return "unknown_job"
+        with self._connect() as con:
+            con.execute("BEGIN IMMEDIATE")
+            if not con.execute("SELECT 1 FROM jobs WHERE job_id=?", (job_id,)).fetchone():
+                return "unknown_job"
+            row = next((item for item in self._active_rows(con) if item["job_id"] == job_id), None)
+            if row is None:
+                return "not_blocking"
+            try:
+                original = json.loads(row["result_json"])
+            except (ValueError, TypeError):
+                return "unsafe_state"
+            if (row["state"] not in ("queued", "running", "submission_uncertain") or
+                not _consistent_record(job_id, row["state"], row["worker_pid"], row["worker_identity"], original)):
+                return "unsafe_state"
+            observed = self._worker_state(row)
+            if observed == "running":
+                return "worker_running"
+            if observed != "exited":
+                return "identity_unconfirmed"
+            # Preserve any partial response. The CLI exit is an operator
+            # statement, not a local process-exit observation.
+            released = {**original, "status": "submission_uncertain", "job_id": job_id,
+                        "error": "operator_released", "local_exit_confirmed": False,
+                        "release_basis": "operator_confirmed"}
+            changed = con.execute("UPDATE jobs SET state=?, result_json=? WHERE job_id=? AND state=? "
+                                  "AND result_json IS ?",
+                                  ("operator_released", json.dumps(released), job_id,
+                                   row["state"], row["result_json"])).rowcount
+        return "released" if changed == 1 else "not_blocking"
+
     def find_job(self, task_id: str) -> str | None:
         if not isinstance(task_id, str) or not 1 <= len(task_id) <= 128:
             return None
@@ -343,6 +441,56 @@ class _Ledger:
                 return False
         observed = sum(is_observed(row) for row in rows)
         return observed, len(rows) - observed
+
+
+class _OperatorLedger(_Ledger):
+    """Open an existing ledger without running the ordinary schema setup."""
+    def __init__(self, root: Path):
+        self.root = root
+        self.db = root / "grok-jobs.sqlite3"
+
+    @contextmanager
+    def _connect(self):
+        con = sqlite3.connect(self.db.as_uri() + "?mode=rw", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            yield con
+            con.commit()
+        except BaseException:
+            con.rollback()
+            raise
+        finally:
+            con.close()
+
+    def blocking(self):
+        con = sqlite3.connect(self.db.as_uri() + "?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        try:
+            rows = self._active_rows(con)
+        finally:
+            con.close()
+        return [{"job_id": row["job_id"], "state": row["state"],
+                 "worker_state": self._worker_state(row)} for row in rows]
+
+
+def _existing_ledger(state_root) -> _OperatorLedger | None:
+    """Open an existing ledger for operator tools; never create one."""
+    root = Path(state_root)
+    db = root / "grok-jobs.sqlite3"
+    if not root.is_absolute() or not root.is_dir() or not _not_reparse(root) or not db.is_file() or not _not_reparse(db):
+        return None
+    return _OperatorLedger(root)
+
+
+def blocking_jobs(state_root) -> list[dict] | None:
+    """Jobs holding a local slot; None when no ledger exists."""
+    ledger = _existing_ledger(state_root)
+    return None if ledger is None else ledger.blocking()
+
+
+def operator_release(state_root, job_id: str) -> str:
+    ledger = _existing_ledger(state_root)
+    return "unknown_job" if ledger is None else ledger.operator_release(job_id)
 
 
 def _worker_command(root: Path, job_id: str) -> list[str]:
@@ -407,8 +555,10 @@ class DurableGrokAdapter:
             task_id.encode("utf-8")
         except UnicodeError:
             return {"status": "not_submitted", "reason": "invalid_task"}
-        if len(data) > _MAX_TASK_BYTES or not self.adapter._paths_ready():
-            return {"status": "not_submitted", "reason": "invalid_task_or_configuration"}
+        if len(data) > _MAX_TASK_BYTES:
+            return {"status": "not_submitted", "reason": "invalid_task"}
+        if not self.adapter._paths_ready():
+            return {"status": "not_submitted", "reason": "cli_or_profile_unavailable"}
         self._flush_known_unstarted()
         try:
             result, job_id = self.ledger.reserve(task_id, hashlib.sha256(data).hexdigest(), self.max_concurrency)
@@ -445,14 +595,14 @@ class DurableGrokAdapter:
                 # This caller did not launch a worker, but the failed commit
                 # cannot exclude a competing claimant. Keep the original ID.
                 return {"status": "submission_uncertain", "job_id": job_id,
-                        "error": "worker_start_unconfirmed"}
+                        "reason": "worker_start_unconfirmed", "error": "worker_start_unconfirmed"}
             if unclaimed:
                 return {"status": "not_submitted", "reason": "state_write_failed"}
             # A worker may have claimed the reservation while this caller's
             # request write was failing; never overwrite its state or assert
             # that the provider was not reached.
             return {"status": "submission_uncertain", "job_id": job_id,
-                    "error": "worker_start_unconfirmed"}
+                    "reason": "worker_start_unconfirmed", "error": "worker_start_unconfirmed"}
         options = {"cwd": str(self.ledger.root), "env": _worker_env(), "stdin": subprocess.DEVNULL,
                    "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "shell": False, "close_fds": True}
         if os.name == "nt":
@@ -468,7 +618,8 @@ class DurableGrokAdapter:
                 self.ledger.mark_start_uncertain_if_unclaimed(job_id)
             except (OSError, sqlite3.Error):
                 pass  # An unresolved reservation already blocks resubmission.
-            return {"status": "submission_uncertain", "job_id": job_id}
+            return {"status": "submission_uncertain", "job_id": job_id,
+                    "reason": "worker_start_unconfirmed"}
         return {"status": "queued", "job_id": job_id}
 
     def poll(self, job_id: str) -> dict:
@@ -493,7 +644,7 @@ class DurableGrokAdapter:
         active = observed + uncertain
         with self.ledger._connect() as con:
             rows = con.execute("SELECT job_id,state,worker_pid,worker_identity,result_json FROM jobs "
-                               "WHERE state='finished_uncertain'").fetchall()
+                               "WHERE state IN ('finished_uncertain','operator_released')").fetchall()
         finished_unresolved = 0
         for row in rows:
             try:

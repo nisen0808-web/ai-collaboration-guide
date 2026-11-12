@@ -20,7 +20,7 @@ _MODEL = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}\Z")
 _EVIDENCE_MODEL = re.compile(r"claude-[A-Za-z0-9][A-Za-z0-9._-]{0,89}\Z")
 _MODEL_SOURCE = "cli_result_model_usage"
 _TASK_ID = re.compile(r"[A-Za-z0-9_-]{1,100}\Z")
-_EFFORTS = frozenset({"low", "medium", "high", "max"})
+_EFFORTS = frozenset({"low", "medium", "high", "xhigh", "max"})
 _NETWORK_ENV_NAMES = ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
                       "http_proxy", "https_proxy", "all_proxy", "no_proxy",
                       "NODE_EXTRA_CA_CERTS", "SSL_CERT_FILE", "SSL_CERT_DIR")
@@ -63,6 +63,14 @@ def child_environment(source: Mapping, profile_dir: str, work_dir: str) -> dict[
     env.update({"CLAUDE_CONFIG_DIR": profile, "HOME": work, "USERPROFILE": work,
                 "TEMP": work, "TMP": work, "DISABLE_AUTOUPDATER": "1",
                 "CLAUDE_CODE_MAX_RETRIES": "0", "CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES": "0"})
+    # Keep the profile's own customizations out of a collaboration task:
+    # documented safe mode skips CLAUDE.md, skills, plugins, hooks, MCP
+    # servers and auto memory while login keeps working. The two narrower
+    # switches cover memory files on clients that predate safe mode. These
+    # are requests to the official client, not proof of what it loaded, and
+    # managed policy can still apply.
+    env.update({"CLAUDE_CODE_SAFE_MODE": "1", "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+                "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"})
     return env
 
 

@@ -975,6 +975,20 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         self.assertIs(result["local_exit_confirmed"], True)
         self.assertIs(result["inspection_metadata_unverified"], True)
 
+    def test_operator_release_does_not_claim_observed_exit(self):
+        class Adapter:
+            def submit(self, **kw): return {"status": "queued", "job_id": "job-1"}
+            def poll(self, job_id):
+                return {"status": "submission_uncertain", "error": "operator_released",
+                        "local_exit_confirmed": False, "release_basis": "operator_confirmed"}
+        coordinator = Coordinator(self.db, {"grok": Adapter()})
+        coordinator.submit("grok", "synthetic", "key")
+        result = coordinator.result("grok", "key")
+        self.assertEqual(result["status"], "submission_uncertain")
+        self.assertEqual(result["error"], "operator_released")
+        self.assertEqual(result["release_basis"], "operator_confirmed")
+        self.assertIs(result["local_exit_confirmed"], False)
+
     def test_known_poll_errors_preserved_and_slow_job_reconciles(self):
         class Adapter:
             def __init__(self): self.error = "provider_slow"; self.submits = 0

@@ -16,31 +16,54 @@ sys.path.insert(0, str(ROOT / "core"))
 from coordinator import Coordinator  # noqa: E402
 from mcp_stdio import serve  # noqa: E402
 from claude.durable_claude import DurableClaudeAdapter as ClaudeAdapter  # noqa: E402
+from claude import durable_claude as claude_ledger  # noqa: E402
+from grok import durable_grok as grok_ledger  # noqa: E402
 from claude.readonly_ledger import ReadOnlyClaudeLedger  # noqa: E402
 from grok.durable_grok import DurableGrokAdapter as GrokAdapter  # noqa: E402
 from claude.claude_adapter import ClaudeAdapter as ClaudeLoginAdapter, valid_session_evidence_model  # noqa: E402
 from grok.grok_adapter import GrokAdapter as GrokLoginAdapter  # noqa: E402
 
 
+def _cli_path(path: str | Path) -> str:
+    """Keep launcher links stable while expanding Windows short names when possible."""
+    absolute = os.path.abspath(os.fspath(path))
+    if os.name != "nt":
+        return absolute
+    try:
+        import ctypes
+        from ctypes import wintypes
+        convert = ctypes.WinDLL("kernel32", use_last_error=True).GetLongPathNameW
+        convert.argtypes = (wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD)
+        convert.restype = wintypes.DWORD
+        size = convert(absolute, None, 0)
+        if not size or size > 32768:
+            return absolute
+        buffer = ctypes.create_unicode_buffer(size + 1)
+        written = convert(absolute, buffer, len(buffer))
+        return buffer.value if 0 < written < len(buffer) else absolute
+    except (OSError, AttributeError, ValueError):
+        return absolute
+
+
 def executable(name: str) -> str | None:
     """Resolve a named CLI or an explicitly supplied executable path."""
     found = shutil.which(name)
     if found:
-        return str(Path(found).resolve())
+        return _cli_path(found)
     path = Path(name).expanduser()
-    return str(path.resolve()) if path.is_file() else None
+    return _cli_path(path) if path.is_file() else None
 
 
 def installation_executable(name: str) -> tuple[str, bool]:
     """Pin a found client or explicit path; keep an absent bare CLI name."""
     found = executable(name)
     if found:
-        return str(Path(found).expanduser().resolve()), True
+        return found, True
     path = Path(name).expanduser()
     # An explicitly supplied path must retain its original meaning when the
     # server is started later in another directory, even if not installed yet.
     if path.is_absolute() or len(path.parts) > 1 or name.startswith((".", "~")):
-        return str(path.resolve()), False
+        return _cli_path(path), False
     # A missing bare executable may become available on PATH later.
     return name, False
 
@@ -79,16 +102,30 @@ def codex_registry_available(cli: str, env: dict[str, str]) -> bool:
         return False
 
 
-def build_adapters(args: argparse.Namespace) -> dict:
+def _setup_issue(error: Exception) -> str:
+    if isinstance(error, (ValueError, TypeError)):
+        return "invalid_configuration"
+    return "local_state_unavailable"
+
+
+def build_adapters(args: argparse.Namespace, issues: dict | None = None) -> dict:
     """Prepare provider adapters without logging in or submitting tasks."""
+    issues = {} if issues is None else issues
     data = Path(args.data_dir).expanduser().resolve()
     data.mkdir(parents=True, exist_ok=True, mode=0o700)
     adapters = {}
     invalid_claude = args.claude_session_evidence and not valid_session_evidence_model(args.claude_model)
     if invalid_claude:
-        adapters["claude"] = ReadOnlyClaudeLedger(data / "claude-jobs")
+        issues["claude"] = "session_evidence_model_invalid"
+        try:
+            adapters["claude"] = ReadOnlyClaudeLedger(data / "claude-jobs")
+        except Exception:
+            # The historical ledger may be unavailable; Grok can still start.
+            issues["claude"] = "local_state_unavailable"
     try:
         claude_cli = None if invalid_claude else executable(args.claude_cli)
+        if claude_cli is None and not invalid_claude:
+            issues["claude"] = "cli_not_found"
         if claude_cli:
             profile = (Path(args.claude_profile).expanduser().resolve()
                        if args.claude_profile else data / "claude-profile")
@@ -102,12 +139,14 @@ def build_adapters(args: argparse.Namespace) -> dict:
                 args.claude_effort, enabled=True, timeout_seconds=args.timeout,
                 session_evidence=args.claude_session_evidence,
             )
-    except Exception:
+    except Exception as error:
         # One unavailable provider, including a broken local database, must
         # not prevent the other starting. Do not expose exception details.
-        pass
+        issues["claude"] = _setup_issue(error)
     try:
         grok_cli = executable(args.grok_cli)
+        if grok_cli is None:
+            issues["grok"] = "cli_not_found"
         if grok_cli:
             profile = (Path(args.grok_profile).expanduser().resolve()
                        if args.grok_profile else data / "grok-profile")
@@ -116,8 +155,8 @@ def build_adapters(args: argparse.Namespace) -> dict:
                 grok_cli, args.grok_model, args.grok_effort, str(profile), str(data),
                 timeout_seconds=args.timeout,
             )
-    except Exception:
-        pass
+    except Exception as error:
+        issues["grok"] = _setup_issue(error)
     return adapters
 
 
@@ -148,6 +187,43 @@ def build_login_adapter(args: argparse.Namespace):
                             timeout_seconds=args.timeout)
 
 
+_RELEASE_MESSAGES = {
+    "released": "Released by operator confirmation. The remote outcome remains uncertain; no request was resent.",
+    "not_blocking": "This job does not hold a local slot; nothing changed.",
+    "unknown_job": "No matching job was found in this provider ledger; nothing changed.",
+    "worker_running": "The bound worker is still running; nothing changed.",
+    "identity_unconfirmed": "The worker identity or exit cannot be confirmed; nothing changed.",
+    "unsafe_state": "This job state cannot be safely released; nothing changed.",
+}
+
+
+def reconcile(args: argparse.Namespace) -> int:
+    """Read or carefully release one job; never submit or kill a process."""
+    data = Path(os.path.abspath(os.fspath(Path(args.data_dir).expanduser())))
+    ledger, state = ((claude_ledger, data / "claude-jobs") if args.provider == "claude"
+                     else (grok_ledger, data))
+    if args.release is None:
+        jobs = ledger.blocking_jobs(str(state))
+        if jobs is None:
+            print("No local job ledger exists for this provider.")
+        elif not jobs:
+            print("No job holds a local slot.")
+        else:
+            for job in jobs:
+                worker = job.get("worker_state", "unknown")
+                if worker not in ("running", "exited", "unknown"):
+                    worker = "unknown"
+                print(f"{job['job_id']}  {job['state']}  worker={worker}")
+            print("Check the specific job and provider client process before any release.", file=sys.stderr)
+        return 0
+    if not args.confirm_process_exited:
+        print("Nothing changed. The operator must check the job's client process and add --confirm-process-exited.", file=sys.stderr)
+        return 1
+    outcome = ledger.operator_release(str(state), args.release)
+    print(_RELEASE_MESSAGES.get(outcome, "Nothing changed; the job requires manual investigation."))
+    return 0 if outcome == "released" else 1
+
+
 def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     # Expand only when a mode actually needs the state directory. A check
@@ -173,6 +249,10 @@ def parser() -> argparse.ArgumentParser:
     modes.add_parser("setup-check", parents=[common], help="Check local prerequisites without logging in or changing configuration")
     login = modes.add_parser("login", parents=[common], help="Run a provider's official login")
     login.add_argument("provider", choices=("claude", "grok"))
+    recon = modes.add_parser("reconcile", parents=[common], help="List or carefully release stuck jobs")
+    recon.add_argument("provider", choices=("claude", "grok"))
+    recon.add_argument("--release", metavar="JOB_ID", help="Request release of one local slot")
+    recon.add_argument("--confirm-process-exited", action="store_true", help="Operator confirms the job's client process has exited")
     return result
 
 
@@ -282,6 +362,12 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{label} client was not found during installation; "
                           "its availability must be checked when the server starts.", file=sys.stderr)
             return 0
+        if args.mode == "reconcile":
+            try:
+                return reconcile(args)
+            except Exception:
+                print("Unable to read or update the local job ledger.", file=sys.stderr)
+                return 1
         if args.mode == "login":
             try:
                 provider = build_login_adapter(args)
@@ -300,12 +386,16 @@ def main(argv: list[str] | None = None) -> int:
             if not ok:
                 print("Official login did not complete. Check the client and local configuration.", file=sys.stderr)
             return 0 if ok else 1
-        adapters = build_adapters(args)
+        issues: dict = {}
+        adapters = build_adapters(args, issues)
+        for name in sorted(issues):
+            print(f"{name} adapter not started: {issues[name]}", file=sys.stderr)
         data = Path(args.data_dir).expanduser().resolve()
         # The read-only Claude ledger exists solely to query old tasks. This
         # startup fact must survive an unavailable or locked status probe.
         core = Coordinator(data / "requests.sqlite3", adapters=adapters,
-                           unconfigured_providers=("claude",) if invalid_claude else ())
+                           unconfigured_providers=("claude",) if invalid_claude else (),
+                           setup_issues=issues)
         for stream in (sys.stdin, sys.stdout):
             if hasattr(stream, "reconfigure"):
                 stream.reconfigure(encoding="utf-8", errors="strict")

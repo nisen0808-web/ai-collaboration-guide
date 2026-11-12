@@ -33,6 +33,80 @@ _MAX_INPUT_BYTES = 900_000
 _ACTIVE = ("reserved", "queued", "running", "submission_uncertain")
 
 
+def _process_identity(pid: int) -> str | None:
+    """Identify a live process by PID and creation time, never by PID alone."""
+    if type(pid) is not int or pid <= 0:
+        return None
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return None
+        try:
+            code = wintypes.DWORD()
+            if not kernel.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:
+                return None
+            times = [wintypes.FILETIME() for _ in range(4)]
+            if not kernel.GetProcessTimes(handle, *[ctypes.byref(value) for value in times]):
+                return None
+            return f"{pid}:{times[0].dwHighDateTime}:{times[0].dwLowDateTime}"
+        finally:
+            kernel.CloseHandle(handle)
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return None if fields[0] == "Z" else f"{pid}:{fields[19]}"
+    except (OSError, IndexError):
+        return None
+
+
+def _worker_identity_state(pid, identity) -> str:
+    if type(pid) is not int or pid <= 0 or not isinstance(identity, str):
+        return "unknown"
+    identity_pattern = (rf"{pid}:\d+:\d+" if os.name == "nt" else
+                        rf"{pid}:\d+" if sys.platform.startswith("linux") else None)
+    if identity_pattern is None or not re.fullmatch(identity_pattern, identity):
+        return "unknown"
+    try:
+        current = _process_identity(pid)
+    except (OSError, ValueError):
+        return "unknown"
+    if current is not None:
+        return "running" if current == identity else "exited"
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel.OpenProcess.restype = wintypes.HANDLE
+        kernel.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return "exited" if ctypes.get_last_error() == 87 else "unknown"
+        try:
+            code = wintypes.DWORD()
+            if kernel.GetExitCodeProcess(handle, ctypes.byref(code)) and code.value != 259:
+                return "exited"
+            return "unknown"
+        finally:
+            kernel.CloseHandle(handle)
+    if sys.platform.startswith("linux"):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return "exited"
+        except (OSError, ValueError):
+            pass
+    return "unknown"
+
+
 @contextmanager
 def _connect(db: Path):
     connection = sqlite3.connect(str(db), timeout=10)
@@ -61,6 +135,92 @@ def _atomic_json(path: Path, value: dict) -> None:
             temp.unlink()
         except FileNotFoundError:
             pass
+
+
+# A live worker rewrites its heartbeat every second, including while it waits
+# on a slow client. A much older heartbeat means no worker is updating the row.
+_OPERATOR_STALE_SECONDS = 60
+
+
+def _existing_ledger(state_dir) -> Path | None:
+    """Locate an existing ledger for operator tools; never create one."""
+    state = Path(_absolute(state_dir))
+    db = state / "jobs.sqlite3"
+    try:
+        if (state.is_symlink() or not state.is_dir() or
+            getattr(state.lstat(), "st_file_attributes", 0) & 0x400 or
+            db.is_symlink() or not db.is_file() or
+            getattr(db.lstat(), "st_file_attributes", 0) & 0x400):
+            return None
+    except OSError:
+        return None
+    return db
+
+
+def blocking_jobs(state_dir) -> list[dict] | None:
+    """Read-only list of jobs holding a local slot; None without a ledger."""
+    db = _existing_ledger(state_dir)
+    if db is None:
+        return None
+    con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        has_claims = con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='worker_claims'").fetchone()
+        if has_claims:
+            rows = con.execute("SELECT jobs.id,jobs.status,jobs.heartbeat,worker_claims.pid,worker_claims.identity "
+                               "FROM jobs LEFT JOIN worker_claims ON worker_claims.job_id=jobs.id "
+                               "WHERE jobs.status IN (?,?,?,?) ORDER BY jobs.id", _ACTIVE).fetchall()
+        else:
+            rows = con.execute("SELECT id,status,heartbeat,NULL AS pid,NULL AS identity FROM jobs "
+                               "WHERE status IN (?,?,?,?) ORDER BY id", _ACTIVE).fetchall()
+    finally:
+        con.close()
+    now = time.time()
+    return [{"job_id": row["id"], "state": row["status"],
+             "recently_active": row["heartbeat"] is not None
+                                and 0 <= now - row["heartbeat"] <= _OPERATOR_STALE_SECONDS,
+             "worker_state": _worker_identity_state(row["pid"], row["identity"])}
+            for row in rows]
+
+
+def operator_release(state_dir, job_id: str) -> str:
+    """Release only a fenced worker known exited after explicit user confirmation.
+
+    Missing legacy identity, an active process, or inaccessible process state
+    is never treated as evidence of exit. The caller separately confirms the
+    official client exited; that statement is not an observed process exit.
+    """
+    if not isinstance(job_id, str) or not _TASK_ID.fullmatch(job_id):
+        return "unknown_job"
+    db = _existing_ledger(state_dir)
+    if db is None:
+        return "unknown_job"
+    con = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True, timeout=10)
+    con.row_factory = sqlite3.Row
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        row = con.execute("SELECT status,heartbeat FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return "unknown_job"
+        if row["status"] not in _ACTIVE:
+            return "not_blocking"
+        try:
+            worker = con.execute("SELECT pid,identity FROM worker_claims WHERE job_id=?", (job_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return "identity_unconfirmed"  # Legacy ledger, no worker fence.
+        if worker is None:
+            return "identity_unconfirmed"
+        observed = _worker_identity_state(worker["pid"], worker["identity"])
+        if observed == "running":
+            return "worker_running"
+        if observed != "exited":
+            return "identity_unconfirmed"
+        changed = con.execute("UPDATE jobs SET status='operator_released',error='operator_released' "
+                              "WHERE id=? AND status=?", (job_id, row["status"])).rowcount
+        con.commit()
+        return "released" if changed == 1 else "not_blocking"
+    finally:
+        con.close()
 
 
 class DurableClaudeAdapter:
@@ -92,6 +252,8 @@ class DurableClaudeAdapter:
                         "status TEXT NOT NULL, error TEXT, heartbeat REAL, output_file TEXT)")
             con.execute("CREATE TABLE IF NOT EXISTS session_evidence_intents (job_id TEXT PRIMARY KEY, "
                         "session_id TEXT NOT NULL, quality_json TEXT)")
+            con.execute("CREATE TABLE IF NOT EXISTS worker_claims (job_id TEXT PRIMARY KEY, "
+                        "pid INTEGER NOT NULL, identity TEXT)")
 
     def login(self) -> dict:
         return self._adapter.login()
@@ -99,7 +261,8 @@ class DurableClaudeAdapter:
     def status(self) -> dict:
         with _connect(self.db) as con:
             rows = con.execute("SELECT status,heartbeat FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchall()
-            finished_unresolved = con.execute("SELECT COUNT(*) FROM jobs WHERE status='finished_uncertain'").fetchone()[0]
+            finished_unresolved = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN "
+                                              "('finished_uncertain','operator_released')").fetchone()[0]
         # A recent heartbeat is a local observation, not proof that a worker
         # or its provider child is alive. Uncertain rows continue to own slots.
         now = time.time()
@@ -147,7 +310,7 @@ class DurableClaudeAdapter:
                     if heartbeat is None or not 0 <= time.time() - heartbeat <= 10:
                         prior = "submission_uncertain"
                     return {"status": prior, "job_id": task_id, "replayed": True}
-                if prior in ("reserved", "submission_uncertain", "finished_uncertain"):
+                if prior in ("reserved", "submission_uncertain", "finished_uncertain", "operator_released"):
                     return {"status": "submission_uncertain", "job_id": task_id, "replayed": True}
                 # This invocation did not start new work. Return the handle
                 # of the original terminal record so callers can poll it; do
@@ -248,6 +411,12 @@ class DurableClaudeAdapter:
             except (ValueError, TypeError):
                 session_quality = _stored_session_quality(None)
         status, error, heartbeat, output_file = row
+        if status == "operator_released":
+            result = {"status": "submission_uncertain", "error": "operator_released",
+                      "local_exit_confirmed": False, "release_basis": "operator_confirmed"}
+            if session_quality is not None:
+                result["quality_verification"] = {**_stored_model_quality(None), **session_quality}
+            return result
         if status == "finished_uncertain":
             # Local CLI exit is confirmed, but the remote outcome is not.
             # It does not occupy a live local slot and cannot be re-sent.
@@ -326,6 +495,29 @@ def _run_worker(state_dir: str, job_id: str) -> None:
                     raise ValueError("session intent unavailable")
         return True
     try:
+        # Claim the original job before any provider process can start. The
+        # unique claim and release transaction form a durable single-launch
+        # fence; legacy workers never create a claim and remain unreleasable.
+        pid = os.getpid()
+        identity = _process_identity(pid)
+        with _connect(db) as con:
+            con.execute("BEGIN IMMEDIATE")
+            # A worker may be launched by an older still-running coordinator
+            # against an existing ledger that predates worker_claims. Creating
+            # this additive table here preserves that original request.
+            con.execute("CREATE TABLE IF NOT EXISTS worker_claims (job_id TEXT PRIMARY KEY, "
+                        "pid INTEGER NOT NULL, identity TEXT)")
+            row = con.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row is None or row["status"] not in _ACTIVE:
+                return
+            try:
+                con.execute("INSERT INTO worker_claims VALUES (?,?,?)", (job_id, pid, identity))
+            except sqlite3.IntegrityError:
+                return
+            changed = con.execute("UPDATE jobs SET status='running',heartbeat=? WHERE id=? AND status=?",
+                                  (time.time(), job_id, row["status"])).rowcount
+            if changed != 1:
+                raise ValueError("worker claim not committed")
         raw = sys.stdin.buffer.read(_MAX_INPUT_BYTES + 1)
         if len(raw) > _MAX_INPUT_BYTES:
             raise ValueError("input too large")

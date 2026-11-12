@@ -55,7 +55,7 @@ class ReadOnlyClaudeLedger:
         try:
             with self._connection() as con:
                 rows = con.execute("SELECT status,heartbeat FROM jobs WHERE status IN (?,?,?,?)", _ACTIVE).fetchall()
-                finished = con.execute("SELECT COUNT(*) FROM jobs WHERE status='finished_uncertain'").fetchone()[0]
+                finished = con.execute("SELECT COUNT(*) FROM jobs WHERE status IN ('finished_uncertain','operator_released')").fetchone()[0]
             now = time.time()
             observed = sum(row[0] in ("queued", "running") and row[1] is not None
                            and 0 <= now - row[1] <= 10 for row in rows)
@@ -102,6 +102,9 @@ class ReadOnlyClaudeLedger:
             return result
 
         status, error, heartbeat, output_file = row
+        if status == "operator_released":
+            return attach({"status": "submission_uncertain", "error": "operator_released",
+                           "local_exit_confirmed": False, "release_basis": "operator_confirmed"})
         if status == "finished_uncertain":
             return attach({"status": "submission_uncertain", "error": error, "local_exit_confirmed": True})
         if status == "succeeded":
