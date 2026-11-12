@@ -59,6 +59,23 @@ class EntryPointTests(unittest.TestCase):
             self.assertTrue(json.loads(output.getvalue())["global_rules"]["agents_file_present"])
             self.assertEqual((config / "AGENTS.md").read_text(encoding="utf-8"), "existing")
 
+    def test_setup_check_can_use_codex_home_without_a_system_home(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch.dict(os.environ, {"CODEX_HOME": tmp}), \
+             patch.object(Path, "home", side_effect=RuntimeError("synthetic private path")), \
+             patch.object(ai_team, "executable", return_value=None), redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(ai_team.main(["setup-check"]), 0)
+            self.assertFalse(json.loads(output.getvalue())["rules_loaded_checked"])
+
+    def test_setup_check_failure_is_specific_and_hides_details(self):
+        stderr = io.StringIO()
+        with patch.object(ai_team, "executable", side_effect=OSError("synthetic private path")), \
+             redirect_stdout(io.StringIO()), redirect_stderr(stderr):
+            self.assertEqual(ai_team.main(["setup-check"]), 1)
+        self.assertIn("Unable to check local prerequisites", stderr.getvalue())
+        self.assertNotIn("synthetic private path", stderr.getvalue())
+        self.assertNotIn("start the local collaboration service", stderr.getvalue())
+
     def test_builds_both_adapters_without_starting_clients(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = ai_team.parser().parse_args(["serve", "--data-dir", tmp,

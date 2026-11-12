@@ -116,7 +116,9 @@ def build_login_adapter(args: argparse.Namespace):
 
 def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--data-dir", default=str(Path.home() / ".local-ai-team"),
+    # Expand only when a mode actually needs the state directory. A check
+    # using an explicit CODEX_HOME must work even when HOME is unavailable.
+    common.add_argument("--data-dir", default="~/.local-ai-team",
                         help="Private local state directory")
     common.add_argument("--claude-cli", default="claude", help="Claude Code executable")
     common.add_argument("--grok-cli", default="grok", help="Grok Build executable")
@@ -250,7 +252,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except Exception:
         # Do not echo local paths, credentials, or exception text in MCP logs.
-        print("Unable to start the local collaboration service.", file=sys.stderr)
+        message = ("Unable to check local prerequisites. Check your Codex home and permissions."
+                   if args.mode == "setup-check" else "Unable to start the local collaboration service.")
+        print(message, file=sys.stderr)
         return 1
 
 
