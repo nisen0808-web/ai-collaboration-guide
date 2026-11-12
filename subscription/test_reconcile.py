@@ -139,13 +139,14 @@ class ReconcileTests(unittest.TestCase):
     def test_corrupt_job_records_do_not_echo_secrets_or_terminal_controls(self):
         with tempfile.TemporaryDirectory() as tmp:
             rows = [{"job_id": "private\x1b[31m", "state": "sensitive state", "worker_state": "unknown"}]
-            with patch.object(ai_team.grok_ledger, "blocking_jobs", return_value=rows):
-                code, out, err = self.run_main("reconcile", "grok", "--data-dir", tmp)
-            self.assertEqual(code, 0)
-            self.assertIn("invalid_record  unknown  worker=unknown", out)
-            self.assertNotIn("private", out + err)
-            self.assertNotIn("sensitive", out + err)
-            self.assertNotIn("\x1b", out + err)
+            for provider, ledger in (("claude", ai_team.claude_ledger), ("grok", ai_team.grok_ledger)):
+                with self.subTest(provider=provider), patch.object(ledger, "blocking_jobs", return_value=rows):
+                    code, out, err = self.run_main("reconcile", provider, "--data-dir", tmp)
+                self.assertEqual(code, 0)
+                self.assertIn("invalid_record  unknown  worker=unknown", out)
+                self.assertNotIn("private", out + err)
+                self.assertNotIn("sensitive", out + err)
+                self.assertNotIn("\x1b", out + err)
 
     def test_readonly_legacy_access_reports_operator_assertion_without_claiming_exit(self):
         with tempfile.TemporaryDirectory() as tmp:

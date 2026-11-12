@@ -1,8 +1,8 @@
 """Candidate adapter for the user's own installed Claude Code CLI.
 
 No API keys are requested or read. Users sign in with the official client and
-are responsible for its account and billing settings. This candidate has not
-been approved for public distribution or tested against a real provider.
+are responsible for its account and billing settings. Narrow real-client
+samples and their limitations are documented separately in EVIDENCE.md.
 """
 from __future__ import annotations
 

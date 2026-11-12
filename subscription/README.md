@@ -77,6 +77,8 @@ python ai_team.py reconcile grok --release 任务编号 --confirm-process-exited
 
 如果启动阶段中断，记录可能尚未绑定可验证的工作进程，此时工具无法安全判断是否还有进程会启动，槽位会继续占用。macOS 当前无法核实工作进程身份，也不能用该命令释放。主控应继续其他可完成的工作并说明限制，不要删除数据库、换任务标识重发或猜测进程状态。
 
+如果本机账本尚未创建、不可访问或未通过安全检查，对账会返回失败并说明未检查到原任务；这不代表一定没有任务。
+
 任务标识和请求标识也可能被记录、显示或传给供应商，不应包含个人信息或密钥；对账输出属于本机敏感记录，不应上传到公开仓库。
 
 某一家没有启动时，状态接口的 `setup_issue` 会给出固定原因码：`cli_not_found`（找不到客户端）、`invalid_configuration`（模型、思考强度等参数不合法）、`local_state_unavailable`（本地目录或数据库不可用）或 `session_evidence_model_invalid`。原因码不含路径和错误原文。
@@ -89,6 +91,7 @@ python ai_team.py reconcile grok --release 任务编号 --confirm-process-exited
 | `queued` / `running` | 工作已进入本地队列或正在处理 | 查询同一任务，不重复提交 |
 | `submission_uncertain` | 无法确认提交或结果状态；可能仍在运行 | 继续查询原任务；不要换标识重发 |
 | `succeeded` | 工具记录完整成功结果 | 检查回答及实际可核验的模型证据 |
+| `incomplete` | 结果不完整，例如输出被截断 | 仅将可见部分当作部分内容，不当作完整答案 |
 | `failed` | 本地记录明确失败 | 报告原因，不把失败或部分内容当成功 |
 
 ## 结果与隐私
