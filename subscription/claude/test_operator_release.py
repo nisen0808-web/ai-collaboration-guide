@@ -70,7 +70,7 @@ class OperatorReleaseTests(unittest.TestCase):
                  mock.patch.object(Path, "lstat", fake_lstat), \
                  mock.patch.object(durable.sqlite3, "connect", side_effect=AssertionError("must not open")):
                 self.assertIsNone(durable.blocking_jobs(str(self.state)))
-                self.assertEqual(durable.operator_release(str(self.state), "protected"), "unknown_job")
+                self.assertEqual(durable.operator_release(str(self.state), "protected"), "ledger_unavailable")
         with closing(sqlite3.connect(self.state / "jobs.sqlite3")) as con:
             self.assertEqual(con.execute("SELECT status FROM jobs WHERE id='protected'").fetchone()[0], "running")
 
@@ -87,7 +87,7 @@ class OperatorReleaseTests(unittest.TestCase):
             self.assertTrue(getattr(junction.lstat(), "st_file_attributes", 0) & 0x400)
             with mock.patch.object(durable.sqlite3, "connect", side_effect=AssertionError("must not open")):
                 self.assertIsNone(durable.blocking_jobs(str(junction)))
-                self.assertEqual(durable.operator_release(str(junction), "protected"), "unknown_job")
+                self.assertEqual(durable.operator_release(str(junction), "protected"), "ledger_unavailable")
         finally:
             # Remove this exact synthetic junction, never its target or parent.
             os.rmdir(junction)
