@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import closing, redirect_stderr, redirect_stdout
 import io
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -142,6 +143,66 @@ class ReconcileTests(unittest.TestCase):
                 self.assertNotIn("private", out + err)
                 self.assertNotIn("nothing changed", (out + err).lower())
                 release.assert_called_once()
+
+    def test_real_commit_then_exception_is_reported_as_unconfirmed_for_both_providers(self):
+        # SQLite's commit can have taken effect before the caller observes an
+        # error. Exercise the actual UPDATE/COMMIT on synthetic ledgers rather
+        # than replacing the release function with a mock.
+        for provider in ("claude", "grok"):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as tmp:
+                data = Path(tmp).resolve()
+                job_id = "11111111-1111-4111-8111-111111111111"
+                ledger = ai_team.claude_ledger if provider == "claude" else ai_team.grok_ledger
+                if provider == "claude":
+                    state = data / "claude-jobs"
+                    state.mkdir()
+                    db = state / "jobs.sqlite3"
+                    with closing(sqlite3.connect(db)) as con, con:
+                        con.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
+                                    "status TEXT NOT NULL, error TEXT, heartbeat REAL, output_file TEXT)")
+                        con.execute("CREATE TABLE worker_claims (job_id TEXT PRIMARY KEY, pid INTEGER, identity TEXT)")
+                        con.execute("INSERT INTO jobs VALUES (?,?, 'running', NULL, 1, NULL)", (job_id, "digest"))
+                        con.execute("INSERT INTO worker_claims VALUES (?,?,?)", (job_id, 42, "42:123"))
+                else:
+                    db = data / "grok-jobs.sqlite3"
+                    body = json.dumps({"status": "running", "job_id": job_id, "output": "partial"})
+                    with closing(sqlite3.connect(db)) as con, con:
+                        con.execute(ledger._SCHEMA)
+                        con.execute("INSERT INTO jobs VALUES (?,?,?,'running',?,?,?)",
+                                    (job_id, "task-key", "digest", 42, "42:123", body))
+
+                committed = []
+                original_connect = sqlite3.connect
+
+                class CommitThenRaise(sqlite3.Connection):
+                    def commit(self):
+                        super().commit()
+                        committed.append(True)
+                        raise sqlite3.OperationalError("private simulated commit failure")
+
+                def injected_connect(*args, **kwargs):
+                    kwargs["factory"] = CommitThenRaise
+                    return original_connect(*args, **kwargs)
+
+                with patch.object(ledger.sqlite3, "connect", side_effect=injected_connect), \
+                     patch.object(ledger, "_worker_identity_state", return_value="exited"), \
+                     patch.object(ledger, "operator_release", wraps=ledger.operator_release) as release, \
+                     patch.object(ai_team.subprocess, "Popen", side_effect=AssertionError("must not spawn")) as spawn:
+                    code, out, err = self.run_main("reconcile", provider, "--data-dir", str(data),
+                                                   "--release", job_id, "--confirm-process-exited")
+                self.assertEqual(code, 1)
+                self.assertEqual(committed, [True])
+                self.assertIn("Operation not confirmed", err)
+                self.assertIn("Check the original job", err)
+                self.assertIn("do not retry automatically", err)
+                self.assertNotIn("private", out + err)
+                self.assertNotIn("nothing changed", (out + err).lower())
+                release.assert_called_once()
+                spawn.assert_not_called()
+                with closing(original_connect(db)) as con:
+                    column, key = (("status", "id") if provider == "claude" else ("state", "job_id"))
+                    actual = con.execute(f"SELECT {column} FROM jobs WHERE {key}=?", (job_id,)).fetchone()
+                self.assertEqual(actual, ("operator_released",))
 
     def test_conflicting_finished_state_is_visible_when_blocking(self):
         rows = [{"job_id": "legacy", "state": "finished_uncertain", "worker_state": "unknown"}]
