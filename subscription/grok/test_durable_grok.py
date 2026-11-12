@@ -56,9 +56,19 @@ class DurableTests(unittest.TestCase):
             shutil.copyfile(source, isolated_dir / source.name)
         with mock.patch.object(subject, "__file__", str(isolated_dir / "durable_grok.py")):
             command = subject._worker_command(self.root, "not-a-job")
-        completed = subprocess.run(command, capture_output=True, timeout=20, check=False)
+        # The production worker receives a whitelist without PYTHON* flags.
+        # A control run proves that imports in this isolated directory would
+        # actually write bytecode if the -B option were missing.
+        env = subject._worker_env()
+        completed = subprocess.run(command, capture_output=True, timeout=20, check=False, env=env)
         self.assertEqual(completed.returncode, 2)
+        self.assertEqual(completed.stderr, b"")
         self.assertEqual(list(isolated_dir.rglob("__pycache__")), [])
+        control = subprocess.run([command[0], *command[2:]], capture_output=True, timeout=20,
+                                 check=False, env=env)
+        self.assertEqual(control.returncode, 2)
+        self.assertEqual(control.stderr, b"")
+        self.assertTrue(list(isolated_dir.rglob("__pycache__")))
 
     def test_worker_omits_invalid_synthetic_network_value(self):
         with mock.patch.object(subject.os, "environ", {"HTTPS_PROXY": "invalid\0value"}):

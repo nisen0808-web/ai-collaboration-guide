@@ -52,7 +52,7 @@ observed model and effort. This is an adapter-reported check; the coordinator
 does not independently authenticate the record's origin. `verified` and
 `server_effort_verified` remain false: these are local client records, not a
 signed attestation of server execution.
-In one isolated Windows MCP test, a synthetic task returned the expected
+In one isolated Windows MCP test on 2026-11-13 using Grok CLI 1.0.52, a synthetic task returned the expected
 answer, and the tool reported `client_record_verified: true`, with client
 records showing `grok-4.7` and `xhigh`. Server-side effort remains unverified;
 one test does not establish compatibility with other client versions or setups.
