@@ -1230,7 +1230,8 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
                 self.submits += 1
                 return {"status": "queued", "job_id": "job-1"}
             def poll(self, job_id):
-                return {"status": "succeeded", "output": "partial body", "truncated": True}
+                return {"status": "succeeded", "output": "partial body", "truncated": True,
+                        "local_exit_confirmed": True}
         adapter = Adapter()
         c = Coordinator(self.db, {"grok": adapter})
         c.submit("grok", "task", "key")
@@ -1238,6 +1239,7 @@ Coordinator(sys.argv[1], {"grok": blocked}).submit("grok", "task", "key")
         self.assertEqual(response["status"], "incomplete")
         self.assertEqual(response["execution_status"], "succeeded")
         self.assertEqual(response["output_kind"], "partial")
+        self.assertIs(response["local_exit_confirmed"], True)
         self.assertTrue(response["truncated"])
         self.assertEqual(response["output"], "partial body")
         self.assertTrue(c.get("key")["truncated"])

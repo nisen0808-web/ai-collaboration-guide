@@ -459,11 +459,37 @@ class DurableTests(unittest.TestCase):
         state = self.adapter().poll(job_id)
         self.assertEqual(state["status"], "succeeded")
         self.assertEqual(state["output"], "synthetic answer")
+        self.assertIs(state["local_exit_confirmed"], True)
         self.assertEqual(state["quality_verification"]["client_evidence_status"], "unavailable")
         self.assertNotIn("synthetic evidence failure", repr(state))
         with mock.patch.object(subject.subprocess, "Popen", side_effect=AssertionError("must not relaunch")) as duplicate:
             self.assertEqual(adapter.submit("synthetic task", "evidence-order")["reason"], "already_submitted")
         duplicate.assert_not_called()
+        self.assertEqual(launch.call_count, 1)
+
+    def test_confirmed_exit_survives_durable_evidence_update(self):
+        adapter = self.adapter()
+        with mock.patch.object(subject.subprocess, "Popen", return_value=mock.Mock(pid=123)):
+            receipt = adapter.submit("synthetic task", "matched-evidence")
+        job_id = receipt["job_id"]
+        grok_module = sys.modules[subject.GrokAdapter.__module__]
+        class Child:
+            def __init__(self, argv, **kwargs):
+                kwargs["stdout"].write(b"synthetic answer")
+                kwargs["stdout"].flush()
+            def wait(self, timeout=None): return 0
+        report = {name: [] for name in grok_module._INSPECT_KEYS}
+        evidence = {"client_evidence_status": "matched", "client_model_matches_requested": True,
+                    "client_effort_matches_requested": True}
+        with mock.patch.object(grok_module.subprocess, "run", return_value=mock.Mock(returncode=0, stdout=json.dumps(report).encode())), \
+             mock.patch.object(grok_module.subprocess, "Popen", side_effect=Child) as launch, \
+             mock.patch.object(grok_module.session_evidence, "preflight", return_value=True), \
+             mock.patch.object(grok_module.session_evidence, "collect", return_value=evidence):
+            self.assertEqual(subject.worker_main(str(self.root), job_id), 0)
+        state = self.adapter().poll(job_id)
+        self.assertEqual(state["quality_verification"]["client_evidence_status"], "matched")
+        self.assertIs(state["local_exit_confirmed"], True)
+        self.assertEqual(state["output"], "synthetic answer")
         self.assertEqual(launch.call_count, 1)
 
     def test_store_checks_job_and_never_overwrites_terminal_result(self):
@@ -485,6 +511,7 @@ class DurableTests(unittest.TestCase):
         self.assertTrue(adapter.ledger.store(first, initial))
         self.assertFalse(adapter.ledger.store(first, {"job_id": first, "status": "failed"}))
         self.assertFalse(adapter.ledger.store(first, {**initial, "output": "changed"}))
+        self.assertFalse(adapter.ledger.store(first, {**initial, "local_exit_confirmed": False}))
         final = {**initial, "quality_verification": {"client_evidence_status": "matched"}}
         self.assertTrue(adapter.ledger.store(first, final))
         self.assertFalse(adapter.ledger.store(first, initial))
@@ -492,6 +519,18 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(adapter.ledger.get(second), before_second)
         self.assertFalse(adapter.ledger.store("00000000-0000-4000-8000-000000000000",
                                               {"job_id": "00000000-0000-4000-8000-000000000000", "status": "running"}))
+
+    def test_legacy_success_without_exit_evidence_stays_missing(self):
+        adapter = self.adapter()
+        _, job_id = adapter.ledger.reserve("legacy", "digest", 1)
+        self.assertTrue(adapter.ledger.claim(job_id))
+        old = {"job_id": job_id, "status": "succeeded", "output": "legacy",
+               "quality_verification": {"client_evidence_status": "pending"}}
+        self.assertTrue(adapter.ledger.store(job_id, old))
+        self.assertFalse(adapter.ledger.store(job_id, {**old, "local_exit_confirmed": True}))
+        updated = {**old, "quality_verification": {"client_evidence_status": "matched"}}
+        self.assertTrue(adapter.ledger.store(job_id, updated))
+        self.assertNotIn("local_exit_confirmed", self.adapter().poll(job_id))
 
     def test_store_true_requires_successful_sqlite_commit(self):
         adapter = self.adapter()
