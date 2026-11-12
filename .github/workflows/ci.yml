@@ -34,4 +34,4 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: Run offline tests
-        run: python -m unittest -v test_collaborate test_preflight test_api test_errors test_interrupt
+        run: python -m unittest -v test_collaborate test_preflight test_api test_errors test_interrupt test_windows_keyboard_interrupt
