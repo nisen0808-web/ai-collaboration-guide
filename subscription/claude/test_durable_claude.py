@@ -173,8 +173,11 @@ class DurableTests(unittest.TestCase):
                 "print(json.dumps(a.submit('synthetic prompt','restart-job')))" )
         # Release the synthetic worker even if an earlier assertion fails.
         self.addCleanup((self.state / "release").write_text, "go", encoding="ascii")
-        result = subprocess.run([sys.executable, "-c", code, module_dir, str(fake), json.dumps(self.args)],
-                                capture_output=True, text=True, encoding="utf-8", timeout=10)
+        try:
+            result = subprocess.run([sys.executable, "-c", code, module_dir, str(fake), json.dumps(self.args)],
+                                    capture_output=True, text=True, encoding="utf-8", timeout=10)
+        except subprocess.TimeoutExpired:
+            raise AssertionError("synthetic worker launcher timed out") from None
         self.assertEqual(result.returncode, 0, "synthetic worker launcher failed")
         receipt = json.loads(result.stdout)
         self.assertEqual(receipt["status"], "queued")
@@ -230,6 +233,17 @@ class DurableTests(unittest.TestCase):
         self.assertEqual(output["status"], "succeeded")
         self.assertEqual(output["output"], "synthetic result")
         self.assertNotIn(b"synthetic prompt", (self.state / "jobs.sqlite3").read_bytes())
+
+    def test_synthetic_launcher_timeout_does_not_expose_command(self):
+        nested = DurableTests("test_parent_exit_then_new_adapter_recovers_fake_worker_result")
+        result = unittest.TestResult()
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("synthetic-private-path", 10)):
+            nested.run(result)
+        self.assertEqual(len(result.failures), 1)
+        self.assertFalse(result.errors)
+        details = result.failures[0][1]
+        self.assertIn("synthetic worker launcher timed out", details)
+        self.assertNotIn("synthetic-private-path", details)
 
 
 if __name__ == "__main__":
