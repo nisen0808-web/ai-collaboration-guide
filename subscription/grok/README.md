@@ -52,6 +52,10 @@ observed model and effort. This is an adapter-reported check; the coordinator
 does not independently authenticate the record's origin. `verified` and
 `server_effort_verified` remain false: these are local client records, not a
 signed attestation of server execution.
+In one isolated Windows MCP test, a synthetic task returned the expected
+answer, and the tool reported `client_record_verified: true`, with client
+records showing `grok-4.7` and `xhigh`. Server-side effort remains unverified;
+one test does not establish compatibility with other client versions or setups.
 The answer is saved before evidence is read; a later poll can retrieve updated
 evidence, and missing or unsafe evidence leaves the answer usable but unverified.
 If the final result cannot be committed to the local ledger, the adapter keeps
