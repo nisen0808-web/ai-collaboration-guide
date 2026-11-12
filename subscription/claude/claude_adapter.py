@@ -35,6 +35,16 @@ def valid_session_evidence_model(model: object) -> bool:
     return isinstance(model, str) and bool(_EVIDENCE_MODEL.fullmatch(model))
 
 
+def valid_model(model: object) -> bool:
+    """The same syntax rule the adapter constructor enforces."""
+    return isinstance(model, str) and bool(_MODEL.fullmatch(model))
+
+
+def valid_effort(effort: object) -> bool:
+    """The same effort set the adapter constructor enforces."""
+    return isinstance(effort, str) and effort in _EFFORTS
+
+
 def _absolute(path) -> str:
     if not isinstance(path, (str, os.PathLike)):
         raise ValueError("invalid path")
@@ -175,9 +185,9 @@ class ClaudeAdapter:
         self.cli_path = _absolute(cli_path)
         self.profile_dir = _absolute(profile_dir)
         self.work_dir = _absolute(work_dir)
-        if not isinstance(model, str) or not _MODEL.fullmatch(model):
+        if not valid_model(model):
             raise ValueError("invalid model")
-        if not isinstance(effort, str) or effort not in _EFFORTS:
+        if not valid_effort(effort):
             raise ValueError("invalid effort")
         if type(enabled) is not bool:
             raise ValueError("enabled must be boolean")

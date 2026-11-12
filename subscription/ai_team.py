@@ -22,6 +22,21 @@ from claude.readonly_ledger import ReadOnlyClaudeLedger  # noqa: E402
 from grok.durable_grok import DurableGrokAdapter as GrokAdapter  # noqa: E402
 from claude.claude_adapter import ClaudeAdapter as ClaudeLoginAdapter, valid_session_evidence_model  # noqa: E402
 from grok.grok_adapter import GrokAdapter as GrokLoginAdapter  # noqa: E402
+from claude import claude_adapter as claude_rules  # noqa: E402
+from grok import grok_adapter as grok_rules  # noqa: E402
+
+
+def rejected_install_options(args: argparse.Namespace) -> list[str]:
+    """Name options the adapters would refuse when the server later starts.
+
+    Only option names are returned, never their values. Passing this check
+    does not show that an account can actually use the model or effort.
+    """
+    checks = (("--claude-model", claude_rules.valid_model(args.claude_model)),
+              ("--claude-effort", claude_rules.valid_effort(args.claude_effort)),
+              ("--grok-model", getattr(args, "_grok_model_explicit", False) and grok_rules.valid_model(args.grok_model)),
+              ("--grok-effort", grok_rules.valid_effort(args.grok_effort)))
+    return [name for name, accepted in checks if not accepted]
 
 
 def _cli_path(path: str | Path) -> str:
@@ -234,6 +249,12 @@ def reconcile(args: argparse.Namespace) -> int:
     return 0 if outcome == "released" else 1
 
 
+class _ExplicitGrokModel(argparse.Action):
+    def __call__(self, parser, namespace, value, option_string=None):
+        setattr(namespace, self.dest, value)
+        setattr(namespace, "_grok_model_explicit", True)
+
+
 def parser() -> argparse.ArgumentParser:
     common = argparse.ArgumentParser(add_help=False)
     # Expand only when a mode actually needs the state directory. A check
@@ -245,7 +266,8 @@ def parser() -> argparse.ArgumentParser:
     common.add_argument("--claude-profile", help="Optional existing Claude Code profile directory")
     common.add_argument("--grok-profile", help="Optional existing Grok Build profile directory")
     common.add_argument("--claude-model", default="sonnet", help="Model or official Claude alias")
-    common.add_argument("--grok-model", default="grok-build", help="Model supported by your Grok account")
+    common.add_argument("--grok-model", default="grok-build", action=_ExplicitGrokModel,
+                        help="Model supported by your Grok account (required for a new installation)")
     common.add_argument("--claude-effort", default="medium", help="Claude thinking level")
     common.add_argument("--claude-session-evidence", action="store_true",
                         help="Explicit Windows-only opt-in: the official client may store task text and answers in a private session; cleanup is not guaranteed")
@@ -274,6 +296,16 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "install" and invalid_claude:
         print("Claude session evidence requires an explicit full claude-* model ID; bare aliases are not supported.", file=sys.stderr)
         return 1
+    if args.mode == "install":
+        # Refuse before any marker is written: a registration the server can
+        # never start with would otherwise be locked in by the markers.
+        rejected = rejected_install_options(args)
+        if rejected:
+            print("Nothing was installed or recorded. Not accepted: " + ", ".join(rejected) + ". "
+                  "For a new installation, choose an account-supported model with --grok-model. "
+                  "Claude effort: low, medium, high, xhigh or max. Grok effort: low, medium, high or xhigh.",
+                  file=sys.stderr)
+            return 1
     if args.mode == "serve" and invalid_claude:
         print("Claude session evidence requires an explicit full claude-* model ID; new Claude tasks are disabled.", file=sys.stderr)
     try:
@@ -309,22 +341,29 @@ def main(argv: list[str] | None = None) -> int:
             codex_home = codex_home.resolve()
             codex_home.mkdir(parents=True, exist_ok=True, mode=0o700)
             global_marker = codex_home / ".ai-collaboration-guide-install-attempt"
+            previous_attempt = ("A previous installation attempt exists. No server was added; "
+                                "check Codex and the installation markers before making changes.")
+            if os.path.lexists(global_marker):
+                print(previous_attempt, file=sys.stderr)
+                return 1
+            codex_env = os.environ.copy()
+            codex_env["CODEX_HOME"] = str(codex_home)
+            # The registry query does not invoke Codex add. It may create CLI
+            # caches, but a failed query need not reserve an installation.
+            if not codex_registry_available(codex_cli, codex_env):
+                print("Could not safely verify existing Codex services. This attempt did not call "
+                      "Codex add or create an installation marker; check Codex before trying again.", file=sys.stderr)
+                return 1
             try:
                 global_fd = os.open(global_marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             except FileExistsError:
-                print("A previous installation attempt exists. No server was added; "
-                      "check Codex and the installation markers before making changes.", file=sys.stderr)
+                # Another attempt reserved this Codex home during the query.
+                print(previous_attempt, file=sys.stderr)
                 return 1
             with os.fdopen(global_fd, "w", encoding="utf-8") as stream:
                 stream.write("attempt\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            codex_env = os.environ.copy()
-            codex_env["CODEX_HOME"] = str(codex_home)
-            if not codex_registry_available(codex_cli, codex_env):
-                print("Could not safely verify existing Codex services. Check Codex before "
-                      "changing installation markers or trying again.", file=sys.stderr)
-                return 1
             # Reserve the installation attempt before invoking Codex. An
             # interrupted command may already have changed Codex, so a
             # subsequent invocation must not silently add another server.

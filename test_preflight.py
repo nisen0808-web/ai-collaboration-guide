@@ -35,6 +35,35 @@ class PreflightChecks(unittest.TestCase):
         self.assertEqual(count, 0)
         self.assertNotIn("line", out)
 
+    def test_swapped_keys_send_nothing_and_are_not_echoed(self):
+        env = {"CLAUDE_MODEL": "claude-test", "GROK_MODEL": "grok-test",
+               "COLLAB_ANTHROPIC_KEY": "xai-fake-swapped", "COLLAB_XAI_KEY": "sk-ant-fake-swapped"}
+        code, out, err, count = self.run_case(env, "example", ["--confirm-paid", "--stdin-utf8"])
+        result = json.loads(out)
+        self.assertEqual(code, 2)
+        self.assertEqual(count, 0)
+        for name in ("claude", "grok"):
+            self.assertEqual(result["providers"][name],
+                             {"status": "not_submitted", "reason": "credential_for_other_provider"})
+        self.assertNotIn("fake-swapped", out + err)
+
+    def test_one_misdirected_key_blocks_both_providers(self):
+        env = {"CLAUDE_MODEL": "claude-test", "GROK_MODEL": "grok-test",
+               "COLLAB_ANTHROPIC_KEY": "sk-ant-fake-one", "COLLAB_XAI_KEY": "sk-ant-fake-two"}
+        code, out, _, count = self.run_case(env, "example", ["--confirm-paid", "--stdin-utf8"])
+        result = json.loads(out)
+        self.assertEqual((code, count), (2, 0))
+        self.assertEqual(result["providers"]["grok"]["reason"], "credential_for_other_provider")
+        self.assertEqual(result["providers"]["claude"]["reason"], "peer_not_ready")
+
+    def test_key_prefix_check_accepts_own_and_unprefixed_keys(self):
+        self.assertFalse(m.key_for_other_provider("claude", "sk-ant-fake"))
+        self.assertFalse(m.key_for_other_provider("grok", "xai-fake"))
+        self.assertFalse(m.key_for_other_provider("claude", "fake-key"))
+        self.assertFalse(m.key_for_other_provider("grok", "fake-key"))
+        self.assertTrue(m.key_for_other_provider("claude", "xai-fake"))
+        self.assertTrue(m.key_for_other_provider("grok", "sk-ant-fake"))
+
     def test_bad_model_fails_before_input_secrets(self):
         env = {"CLAUDE_MODEL": "bad model", "GROK_MODEL": "grok-test"}
         code, out, _, count = self.run_case(env, "example", ["--confirm-paid", "--stdin-utf8", "--ask-keys"])

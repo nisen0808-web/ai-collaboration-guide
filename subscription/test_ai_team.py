@@ -408,7 +408,7 @@ class EntryPointTests(unittest.TestCase):
              patch.object(ai_team.subprocess, "run", return_value=completed) as run, \
              patch.object(ai_team, "build_adapters", side_effect=AssertionError("provider started")), \
              redirect_stdout(output):
-            self.assertEqual(ai_team.main(["install", "--data-dir", tmp]), 0)
+            self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp]), 0)
             self.assertTrue(Path(tmp, "codex-install-attempt.txt").exists())
         command = run.call_args.args[0]
         self.assertEqual(command[1:3], ["mcp", "add"])
@@ -426,7 +426,7 @@ class EntryPointTests(unittest.TestCase):
             with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
                  patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not add")), \
                  redirect_stderr(stderr):
-                self.assertEqual(ai_team.main(["install", "--data-dir", tmp]), 1)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp]), 1)
             self.assertEqual(marker.read_text(encoding="utf-8"), "opaque existing content")
             self.assertIn("No server was added", stderr.getvalue())
             self.assertNotIn("opaque existing content", stderr.getvalue())
@@ -454,7 +454,7 @@ class EntryPointTests(unittest.TestCase):
                      patch.object(ai_team.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, \
                      redirect_stdout(io.StringIO()):
                     self.assertEqual(ai_team.main([
-                        "install", "--data-dir", "data", "--claude-cli", "bin/claude-test",
+                        "install", "--grok-model", "grok-synthetic", "--data-dir", "data", "--claude-cli", "bin/claude-test",
                         "--grok-cli", "bin/grok-test", "--claude-profile", "profiles/claude",
                         "--grok-profile", "profiles/grok"]), 0)
                 command = run.call_args.args[0]
@@ -485,7 +485,7 @@ class EntryPointTests(unittest.TestCase):
                      patch.object(ai_team.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, \
                      redirect_stdout(io.StringIO()), redirect_stderr(stderr):
                     self.assertEqual(ai_team.main([
-                        "install", "--data-dir", "data", "--claude-cli", "future-claude",
+                        "install", "--grok-model", "grok-synthetic", "--data-dir", "data", "--claude-cli", "future-claude",
                         "--grok-cli", "bin/future-grok"]), 0)
                 stored = ai_team.parser().parse_args(run.call_args.args[0][7:])
                 self.assertEqual(stored.claude_cli, "future-claude")
@@ -502,8 +502,8 @@ class EntryPointTests(unittest.TestCase):
             with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
                  patch.object(ai_team.subprocess, "run", return_value=failed) as run, \
                  redirect_stdout(stdout), redirect_stderr(stderr):
-                self.assertEqual(ai_team.main(["install", "--data-dir", tmp]), 1)
-                self.assertEqual(ai_team.main(["install", "--data-dir", tmp]), 1)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp]), 1)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp]), 1)
             self.assertEqual(run.call_count, 1)
             self.assertTrue(Path(tmp, "codex-install-attempt.txt").exists())
             self.assertNotIn("Added MCP server", stdout.getvalue())
@@ -521,11 +521,11 @@ class EntryPointTests(unittest.TestCase):
             with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
                  patch.object(ai_team.subprocess, "run", side_effect=run_once) as run, \
                  patch("builtins.print"):
-                first = threading.Thread(target=lambda: result.append(ai_team.main(["install", "--data-dir", tmp])))
+                first = threading.Thread(target=lambda: result.append(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp])))
                 first.start()
                 try:
                     self.assertTrue(entered.wait(5))
-                    self.assertEqual(ai_team.main(["install", "--data-dir", tmp]), 1)
+                    self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp]), 1)
                 finally:
                     finish.set()
                     first.join(5)
@@ -538,8 +538,8 @@ class EntryPointTests(unittest.TestCase):
             with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
                  patch.object(ai_team.subprocess, "run", side_effect=OSError("synthetic")) as run, \
                  patch("builtins.print"):
-                self.assertEqual(ai_team.main(["install", "--data-dir", tmp]), 1)
-                self.assertEqual(ai_team.main(["install", "--data-dir", tmp]), 1)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp]), 1)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", tmp]), 1)
             self.assertEqual(run.call_count, 1)
             self.assertTrue(Path(tmp, "codex-install-attempt.txt").exists())
 
@@ -548,8 +548,8 @@ class EntryPointTests(unittest.TestCase):
             with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
                  patch.object(ai_team.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, \
                  patch("builtins.print"):
-                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "first"))]), 0)
-                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "second"))]), 1)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "first"))]), 0)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "second"))]), 1)
             self.assertEqual(run.call_count, 1)
             self.assertFalse(Path(tmp, "second", "codex-install-attempt.txt").exists())
 
@@ -560,7 +560,7 @@ class EntryPointTests(unittest.TestCase):
                  patch("builtins.print"):
                 for index in (1, 2):
                     with patch.dict(os.environ, {"CODEX_HOME": str(Path(tmp, f"codex-{index}"))}):
-                        self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, f"data-{index}"))]), 0)
+                        self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, f"data-{index}"))]), 0)
             self.assertEqual(run.call_count, 2)
             homes = [call.kwargs["env"]["CODEX_HOME"] for call in run.call_args_list]
             self.assertEqual(homes, [str(Path(tmp, "codex-1").resolve()), str(Path(tmp, "codex-2").resolve())])
@@ -572,7 +572,7 @@ class EntryPointTests(unittest.TestCase):
              patch.object(ai_team, "codex_registry_available", side_effect=AssertionError("must not query")), \
              patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not add")), \
              patch("builtins.print"):
-            self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "data"))]), 1)
+            self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "data"))]), 1)
             self.assertFalse(Path(tmp, "data").exists())
 
     def test_concurrent_install_different_directories_only_invokes_codex_once(self):
@@ -588,11 +588,11 @@ class EntryPointTests(unittest.TestCase):
                  patch.object(ai_team.subprocess, "run", side_effect=run_once) as run, \
                  patch("builtins.print"):
                 first = threading.Thread(target=lambda: result.append(
-                    ai_team.main(["install", "--data-dir", str(Path(tmp, "first"))])))
+                    ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "first"))])))
                 first.start()
                 try:
                     self.assertTrue(entered.wait(5))
-                    self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "second"))]), 1)
+                    self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "second"))]), 1)
                 finally:
                     finish.set()
                     first.join(5)
@@ -600,24 +600,117 @@ class EntryPointTests(unittest.TestCase):
                 self.assertEqual(result, [0])
                 self.assertEqual(run.call_count, 1)
 
-    def test_unreadable_registry_stops_and_retains_codex_home_marker(self):
+    def test_both_registry_queries_finish_before_only_one_install_reserves(self):
+        """Both callers observe an empty registry before racing for one marker."""
+        with tempfile.TemporaryDirectory() as tmp:
+            barrier = threading.Barrier(2)
+            outcomes = []
+
+            def simultaneous_empty_registry(*_args, **_kwargs):
+                barrier.wait(timeout=10)
+                return True
+
+            def install(index):
+                outcomes.append(ai_team.main([
+                    "install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "data-" + str(index)))
+                ]))
+
+            with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+                 patch.object(ai_team, "codex_registry_available", side_effect=simultaneous_empty_registry) as registry, \
+                 patch.object(ai_team.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as add, \
+                 patch("builtins.print"):
+                workers = [threading.Thread(target=install, args=(index,)) for index in (1, 2)]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(timeout=15)
+                self.assertFalse(any(worker.is_alive() for worker in workers))
+                self.assertEqual(sorted(outcomes), [0, 1])
+                self.assertEqual(registry.call_count, 2)
+                self.assertEqual(add.call_count, 1)
+            self.assertTrue(Path(os.environ["CODEX_HOME"], ".ai-collaboration-guide-install-attempt").is_file())
+            self.assertEqual(sum(Path(tmp, f"data-{index}", "codex-install-attempt.txt").exists()
+                                 for index in (1, 2)), 1)
+
+    def test_unreadable_registry_stops_without_leaving_a_marker(self):
         with tempfile.TemporaryDirectory() as tmp:
             stderr = io.StringIO()
+            marker = Path(os.environ["CODEX_HOME"], ".ai-collaboration-guide-install-attempt")
             with patch.object(ai_team, "codex_registry_available", return_value=False) as registry, \
                  patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
                  patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not add")), \
                  redirect_stderr(stderr):
-                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "first"))]), 1)
-                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "second"))]), 1)
-            self.assertEqual(registry.call_count, 1)
-            self.assertTrue(Path(os.environ["CODEX_HOME"], ".ai-collaboration-guide-install-attempt").is_file())
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "first"))]), 1)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "second"))]), 1)
+            # A read-only query changed nothing, so each attempt may query again.
+            self.assertEqual(registry.call_count, 2)
+            self.assertFalse(marker.exists())
+            self.assertFalse(Path(tmp, "first").exists())
             self.assertNotIn(tmp, stderr.getvalue())
+            # Once the registry can be read, the same Codex home installs normally.
+            with patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+                 patch.object(ai_team.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)) as run, \
+                 patch("builtins.print"):
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "first"))]), 0)
+            self.assertEqual(run.call_count, 1)
+            self.assertTrue(marker.is_file())
+
+    def test_existing_codex_home_marker_stops_before_registry_query(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(os.environ["CODEX_HOME"], ".ai-collaboration-guide-install-attempt")
+            marker.write_text("opaque existing content", encoding="utf-8")
+            with patch.object(ai_team, "codex_registry_available", side_effect=AssertionError("must not query")), \
+                 patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
+                 patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not add")), \
+                 patch("builtins.print"):
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "data"))]), 1)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "opaque existing content")
+            self.assertFalse(Path(tmp, "data").exists())
+
+    def test_new_install_requires_explicit_grok_model_before_any_io(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stderr = io.StringIO()
+            with patch.object(ai_team, "executable", side_effect=AssertionError("must not resolve")), \
+                 patch.object(ai_team, "codex_registry_available", side_effect=AssertionError("must not query")), \
+                 patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not add")), \
+                 redirect_stderr(stderr):
+                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "data"))]), 1)
+            self.assertIn("--grok-model", stderr.getvalue())
+            self.assertFalse(Path(tmp, "data").exists())
+            self.assertFalse(Path(os.environ["CODEX_HOME"], ".ai-collaboration-guide-install-attempt").exists())
+        self.assertEqual(ai_team.parser().parse_args(["serve"]).grok_model, "grok-build")
+        self.assertEqual(ai_team.parser().parse_args(["login", "grok"]).grok_model, "grok-build")
+        explicit = ai_team.parser().parse_args(["install", "--grok-model=grok-synthetic"])
+        self.assertEqual(ai_team.rejected_install_options(explicit), [])
+
+    def test_install_rejects_unusable_options_before_any_marker_or_codex_call(self):
+        cases = (["--grok-effort", "max"], ["--claude-effort", "extreme"],
+                 ["--grok-model", "bad model"], ["--claude-model", ""])
+        for extra in cases:
+            with self.subTest(option=extra[0]), tempfile.TemporaryDirectory() as tmp:
+                stderr = io.StringIO()
+                with patch.object(ai_team, "executable", side_effect=AssertionError("must not resolve")), \
+                     patch.object(ai_team, "codex_registry_available", side_effect=AssertionError("must not query")), \
+                     patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not add")), \
+                     redirect_stderr(stderr):
+                    self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "data")), *extra]), 1)
+                self.assertIn(extra[0], stderr.getvalue())
+                self.assertFalse(Path(tmp, "data").exists())
+                self.assertFalse(Path(os.environ["CODEX_HOME"], ".ai-collaboration-guide-install-attempt").exists())
+
+    def test_install_option_syntax(self):
+        args = ai_team.parser().parse_args(["install", "--grok-model", "grok-synthetic"])
+        self.assertEqual(ai_team.rejected_install_options(args), [])
+        args = ai_team.parser().parse_args(["install", "--grok-model", "grok-synthetic", "--claude-effort", "max", "--grok-effort", "xhigh"])
+        self.assertEqual(ai_team.rejected_install_options(args), [])
+        args = ai_team.parser().parse_args(["install", "--grok-model", "grok-synthetic", "--grok-effort", "max", "--claude-model", "a b"])
+        self.assertEqual(ai_team.rejected_install_options(args), ["--claude-model", "--grok-effort"])
 
     def test_unexpected_install_error_reports_installation_without_details(self):
         stderr = io.StringIO()
         with patch.object(ai_team, "executable", side_effect=OSError("synthetic private path")), \
              redirect_stderr(stderr):
-            self.assertEqual(ai_team.main(["install"]), 1)
+            self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic"]), 1)
         self.assertIn("Unable to complete installation", stderr.getvalue())
         self.assertNotIn("synthetic private path", stderr.getvalue())
 
@@ -677,11 +770,12 @@ class CodexRegistryTests(unittest.TestCase):
                  patch.object(ai_team, "executable", return_value="/synthetic/codex"), \
                  patch.object(ai_team.subprocess, "run", return_value=response) as run, \
                  redirect_stderr(io.StringIO()) as stderr:
-                self.assertEqual(ai_team.main(["install", "--data-dir", str(Path(tmp, "data"))]), 1)
+                self.assertEqual(ai_team.main(["install", "--grok-model", "grok-synthetic", "--data-dir", str(Path(tmp, "data"))]), 1)
             self.assertEqual(run.call_count, 1)
             self.assertEqual(run.call_args.args[0][1:], ["mcp", "list", "--json"])
             self.assertFalse(Path(tmp, "data").exists())
-            self.assertTrue(Path(codex_home, ".ai-collaboration-guide-install-attempt").is_file())
+            # Finding a legacy entry is a read-only observation; no marker.
+            self.assertFalse(Path(codex_home, ".ai-collaboration-guide-install-attempt").exists())
             self.assertNotIn("ai_team_legacy", stderr.getvalue())
 
 

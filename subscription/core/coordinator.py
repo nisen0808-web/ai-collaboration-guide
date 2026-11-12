@@ -22,6 +22,11 @@ class InputError(ValueError):
     pass
 
 
+# Shared limit for newly submitted Claude and Grok tasks. Existing requests
+# created under the former character-based limit remain replayable.
+MAX_TASK_UTF8_BYTES = 100_000
+
+
 # Adapter diagnostics are selected from fixed public machine-readable codes.
 # Never forward arbitrary CLI stderr or exception strings, which may contain
 # user data, filesystem paths, credentials, or authentication information.
@@ -259,7 +264,11 @@ class Coordinator:
             raise InputError("invalid task")
         if not isinstance(request_key, str) or not request_key.strip() or len(request_key) > 200:
             raise InputError("invalid request_key")
-        digest = hashlib.sha256(_canonical({"provider": provider, "task": task}).encode("utf-8")).hexdigest()
+        try:
+            task_bytes = task.encode("utf-8", errors="strict")
+            digest = hashlib.sha256(_canonical({"provider": provider, "task": task}).encode("utf-8")).hexdigest()
+        except UnicodeError:
+            raise InputError("invalid task") from None
         task_id = uuid.uuid4().hex
         with self._db() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -273,6 +282,11 @@ class Coordinator:
                 if replay["status"] == "dispatching":
                     replay["status"] = "submission_uncertain"
                 return replay
+            # The shared byte limit is checked only after matching an existing
+            # request key, so previously accepted long UTF-8 tasks can still
+            # replay their original receipt without starting new work.
+            if len(task_bytes) > MAX_TASK_UTF8_BYTES:
+                raise InputError("task exceeds UTF-8 byte limit")
             conn.execute("INSERT INTO requests VALUES (?, ?, ?, ?, 'dispatching', NULL, NULL)",
                          (request_key, digest, task_id, provider))
         adapter = self.adapters.get(provider)

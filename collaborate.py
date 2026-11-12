@@ -7,12 +7,12 @@ Read a nonsensitive UTF-8 task file with: python collaborate.py --task-file TASK
 This is a synchronous demonstration, not an MCP server or a durable job queue.
 """
 import argparse
-import concurrent.futures
 import getpass
 import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -73,6 +73,17 @@ MAX_TASK_BYTES = MAX_TASK_CHARS * 4 + 4
 def valid_key(key):
     """Headers must be non-empty printable ASCII, without whitespace or controls."""
     return isinstance(key, str) and 1 <= len(key) <= 4096 and all(33 <= ord(ch) <= 126 for ch in key)
+
+
+# Commonly issued key prefixes. Used only to catch a key handed to the wrong
+# provider; a key carrying neither prefix is still accepted, and a matching
+# prefix proves nothing about validity.
+KEY_PREFIXES = {"claude": "sk-ant-", "grok": "xai-"}
+
+
+def key_for_other_provider(provider, key):
+    """True when a key carries the other provider's prefix, e.g. entered in swapped order."""
+    return any(key.startswith(prefix) for name, prefix in KEY_PREFIXES.items() if name != provider)
 
 
 def read_task(task_file, stdin_utf8):
@@ -273,10 +284,16 @@ def safe_http_error_type(error, provider):
 
 
 def run_provider(provider, prompt, model, key, timeout, max_tokens):
+    if provider not in ("claude", "grok"):
+        return {"status": "not_submitted", "reason": "invalid_provider"}
     if not key or not model:
         return {"status": "not_submitted", "reason": "missing_credential_or_model"}
-    if not MODEL.fullmatch(model):
+    if not isinstance(model, str) or not MODEL.fullmatch(model):
         return {"status": "not_submitted", "reason": "invalid_model_identifier"}
+    if not valid_key(key):
+        return {"status": "not_submitted", "reason": "missing_or_invalid_credential"}
+    if key_for_other_provider(provider, key):
+        return {"status": "not_submitted", "reason": "credential_for_other_provider"}
     start = time.monotonic()
     try:
         url, headers, payload = build_request(provider, prompt, model, key, max_tokens)
@@ -310,6 +327,13 @@ def run_provider(provider, prompt, model, key, timeout, max_tokens):
         # Includes network timeout; do not print exception text or retry.
         return {"status": "submission_uncertain", "reason": "transport_error",
                 "retry": "not_attempted"}
+
+
+def _wait_for_workers(workers):
+    # Bounded waits let Python handle Ctrl+C while either provider is slow.
+    for worker in workers:
+        while worker.is_alive():
+            worker.join(timeout=0.1)
 
 
 def main(argv=None):
@@ -369,23 +393,61 @@ def main(argv=None):
     for name, key in (("claude", claude_key), ("grok", grok_key)):
         if not valid_key(key):
             key_issues[name] = "missing_or_invalid_credential"
+        elif key_for_other_provider(name, key):
+            # Sending it would disclose one provider's key to the other.
+            key_issues[name] = "credential_for_other_provider"
     if key_issues:
         return reject_preflight(key_issues)
     secrets = [key for key in (claude_key, grok_key) if key]
     if any(key in task for key in secrets):
         print("Task contains a configured key; no requests sent.", file=sys.stderr)
         return 2
-    # Identical input, independent calls; neither provider receives the other's output.
+    # Daemon threads do not keep the CLI alive after Ctrl+C. Ending the local
+    # process does not prove a request was cancelled or that remote work ended.
+    # When called as a library, a still-running thread can continue after main
+    # returns until the network operation completes or times out.
     providers = {"claude": (claude_model, claude_key), "grok": (grok_model, grok_key)}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        futures = {name: pool.submit(run_provider, name, task, model, key, args.timeout, args.max_tokens)
-                   for name, (model, key) in providers.items()}
-        results = {name: future.result() for name, future in futures.items()}
+    recorded, result_lock, workers = {}, threading.Lock(), []
+
+    def run_and_record(name, model, key):
+        try:
+            value = run_provider(name, task, model, key, args.timeout, args.max_tokens)
+        except BaseException:
+            # No traceback or exception text: it may contain credentials.
+            value = {"status": "submission_uncertain", "reason": "worker_error", "retry": "not_attempted"}
+        with result_lock:
+            recorded[name] = value
+
+    interrupted = False
+    start_error = False
+    try:
+        for name, (model, key) in providers.items():
+            worker = threading.Thread(target=run_and_record, args=(name, model, key), daemon=True)
+            workers.append(worker)
+            worker.start()
+        _wait_for_workers(workers)
+    except KeyboardInterrupt:
+        interrupted = True
+    except Exception:
+        # Thread start/wait errors are not proof that either request did not start.
+        start_error = True
+    with result_lock:
+        # Snapshot into a separate dictionary: a late-running daemon may still
+        # record a result after interruption, but cannot alter this output.
+        results = {name: recorded.get(name, {"status": "submission_uncertain",
+                   "reason": "interrupted_submission_status_unknown" if interrupted else "worker_start_unconfirmed",
+                   "retry": "not_attempted"}) for name in providers}
     # ASCII-safe JSON avoids losing completed, potentially billed results when
     # redirected stdout uses a legacy Windows encoding. JSON decoding restores Unicode.
-    print(json.dumps(redact_keys({"providers": results,
-                      "note": "Independent, unreviewed responses. Model effort is not verified; "
-                              "the coordinating AI must evaluate both results."}, secrets), ensure_ascii=True, indent=2))
+    note = ("Interrupted or local worker unavailable; unfinished requests may have been sent and "
+            "remote work may continue. No retry was attempted." if interrupted or start_error else
+            "Independent, unreviewed responses. Model effort is not verified; "
+            "the coordinating AI must evaluate both results.")
+    print(json.dumps(redact_keys({"providers": results, "note": note}, secrets), ensure_ascii=True, indent=2), flush=True)
+    if interrupted:
+        return 130
+    if start_error:
+        return 1
     return 0 if all(v["status"] == "complete_unreviewed" for v in results.values()) else 1
 
 

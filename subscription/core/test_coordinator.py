@@ -1,3 +1,4 @@
+import hashlib
 import json
 import sqlite3
 import queue
@@ -26,6 +27,61 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(c.submit("claude", "task", "key-c")["status"], "not_submitted")
         self.assertEqual(c.submit("grok", "task", "key-g")["status"], "queued")
         self.assertEqual(len(calls), 1)
+
+    def test_new_tasks_use_same_utf8_byte_limit_for_both_providers(self):
+        calls = []
+        def adapter(**kwargs):
+            calls.append(kwargs)
+            return {"status": "queued", "job_id": "synthetic-job"}
+        coordinator = Coordinator(self.db, {"claude": adapter, "grok": adapter})
+        valid = ("a" * 100_000, "中" * 33_333 + "a", "😀" * 25_000)
+        too_large = ("中" * 33_334, "😀" * 25_000 + "a")
+        for provider in ("claude", "grok"):
+            for index, task in enumerate(valid):
+                with self.subTest(provider=provider, accepted=index):
+                    self.assertEqual(len(task.encode("utf-8")), 100_000)
+                    result = coordinator.submit(provider, task, f"{provider}-valid-{index}")
+                    self.assertEqual(result["status"], "queued")
+            for index, task in enumerate(too_large):
+                key = f"{provider}-large-{index}"
+                with self.subTest(provider=provider, rejected=index):
+                    count = len(calls)
+                    with self.assertRaises(InputError):
+                        coordinator.submit(provider, task, key)
+                    self.assertEqual(len(calls), count)
+                    self.assertEqual(coordinator.get(key)["status"], "not_found")
+
+    def test_invalid_unicode_is_rejected_without_reserving_or_calling_provider(self):
+        adapter = Mock()
+        coordinator = Coordinator(self.db, {"claude": adapter, "grok": adapter})
+        for provider in ("claude", "grok"):
+            with self.subTest(provider=provider), self.assertRaises(InputError):
+                coordinator.submit(provider, "invalid\ud800", f"bad-{provider}")
+            self.assertEqual(coordinator.get(f"bad-{provider}")["status"], "not_found")
+        adapter.assert_not_called()
+
+    def test_historical_over_byte_limit_replays_original_receipt_and_can_be_polled(self):
+        task = "旧" * 40_000  # Old versions accepted this 120,000-byte Claude input.
+        self.assertGreater(len(task.encode("utf-8")), 100_000)
+        adapter = Mock()
+        adapter.poll.return_value = {"status": "running"}
+        coordinator = Coordinator(self.db, {"claude": adapter})
+        canonical = json.dumps({"provider": "claude", "task": task}, ensure_ascii=False,
+                               sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        with coordinator._db() as con:
+            con.execute("INSERT INTO requests VALUES (?,?,?,?,?,?,?)",
+                        ("old-key", digest, "old-task", "claude", "running", "old-job", None))
+        replay = coordinator.submit("claude", task, "old-key")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["job_id"], "old-job")
+        self.assertEqual(coordinator.get("old-key")["status"], "running")
+        self.assertEqual(coordinator.result("claude", "old-key")["status"], "running")
+        adapter.submit.assert_not_called()
+        adapter.poll.assert_called_once_with("old-job")
+        with self.assertRaises(InputError):
+            coordinator.submit("claude", task + "a", "old-key")
+        adapter.submit.assert_not_called()
 
     def test_known_unstarted_write_failure_stays_not_submitted_without_retry(self):
         calls = []

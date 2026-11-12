@@ -35,6 +35,16 @@ _MAX_TASK_BYTES = 100_000
 _MAX_RESULT_BYTES = 256_000
 
 
+def valid_model(model: object) -> bool:
+    """The same syntax rule the adapter constructor enforces."""
+    return isinstance(model, str) and bool(_MODEL.fullmatch(model))
+
+
+def valid_effort(effort: object) -> bool:
+    """The same effort set the adapter constructor enforces."""
+    return isinstance(effort, str) and effort in _EFFORTS
+
+
 class GrokAdapter:
     """In-process worker; job recovery after parent restart is unavailable."""
 
@@ -44,7 +54,7 @@ class GrokAdapter:
         self.profile = Path(profile_dir)
         if not self.cli.is_absolute() or not self.profile.is_absolute():
             raise ValueError("CLI and profile paths must be absolute")
-        if not _MODEL.fullmatch(model or "") or effort not in _EFFORTS:
+        if not valid_model(model) or not valid_effort(effort):
             raise ValueError("choose a valid model and effort")
         if isinstance(timeout_seconds, bool) or not isinstance(timeout_seconds, int) or not 1 <= timeout_seconds <= 900:
             raise ValueError("timeout must be between 1 and 900 seconds")

@@ -21,7 +21,8 @@ TOOLS = [
     {"name": "collab_submit", "description": "Reserve a request and ask its adapter to submit it once.",
      "inputSchema": {"type": "object", "properties": {
          "provider": {"type": "string", "enum": ["claude", "grok"]},
-         "task": {"type": "string", "minLength": 1, "maxLength": 100000},
+         "task": {"type": "string", "minLength": 1, "maxLength": 100000,
+                  "description": "New tasks for either provider must also fit 100000 UTF-8 bytes; an existing matching request key can still replay its prior receipt."},
          "request_key": {"type": "string", "minLength": 1, "maxLength": 200}},
          "required": ["provider", "task", "request_key"], "additionalProperties": False}},
     {"name": "collab_check", "description": "Read an existing request; never submit it again.",
