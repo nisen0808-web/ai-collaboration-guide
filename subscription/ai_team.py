@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from pathlib import Path
 import shutil
@@ -133,6 +134,7 @@ def parser() -> argparse.ArgumentParser:
     modes = result.add_subparsers(dest="mode", required=True)
     modes.add_parser("serve", parents=[common], help="Start the local MCP server")
     modes.add_parser("install", parents=[common], help="Add this service to Codex without changing existing entries")
+    modes.add_parser("setup-check", parents=[common], help="Check local prerequisites without logging in or changing configuration")
     login = modes.add_parser("login", parents=[common], help="Run a provider's official login")
     login.add_argument("provider", choices=("claude", "grok"))
     return result
@@ -149,6 +151,22 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "serve" and invalid_claude:
         print("Claude session evidence requires an explicit full claude-* model ID; new Claude tasks are disabled.", file=sys.stderr)
     try:
+        if args.mode == "setup-check":
+            # A presence check is not proof of login, account entitlement,
+            # MCP registration, rule loading or a successful model request.
+            codex_home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+            report = {
+                "python_supported": sys.version_info >= (3, 10),
+                "clients_found": {"codex": executable(args.codex_cli) is not None,
+                                  "claude": executable(args.claude_cli) is not None,
+                                  "grok": executable(args.grok_cli) is not None},
+                "global_rules": {"agents_file_present": (codex_home / "AGENTS.md").is_file(),
+                                 "override_file_present": (codex_home / "AGENTS.override.md").is_file()},
+                "login_checked": False, "connection_checked": False,
+                "rules_loaded_checked": False, "provider_requests_sent": False,
+            }
+            print(json.dumps(report, ensure_ascii=True, sort_keys=True))
+            return 0
         if args.mode == "install":
             codex_cli = executable(args.codex_cli)
             if codex_cli is None:

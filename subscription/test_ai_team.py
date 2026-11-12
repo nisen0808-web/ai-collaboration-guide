@@ -20,6 +20,45 @@ import ai_team
 
 
 class EntryPointTests(unittest.TestCase):
+    def test_setup_check_is_read_only_and_does_not_report_private_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp, "codex-home")
+            home.mkdir()
+            original = "synthetic existing rules"
+            (home / "AGENTS.override.md").write_text(original, encoding="utf-8")
+            output = io.StringIO()
+            with patch.dict(os.environ, {"CODEX_HOME": str(home)}), \
+                 patch.object(ai_team, "executable", side_effect=lambda name: "/synthetic/client" if name != "grok" else None), \
+                 patch.object(ai_team, "build_adapters", side_effect=AssertionError("must not build")), \
+                 patch.object(ai_team, "build_login_adapter", side_effect=AssertionError("must not log in")), \
+                 patch.object(ai_team.subprocess, "run", side_effect=AssertionError("must not run")), \
+                 redirect_stdout(output):
+                self.assertEqual(ai_team.main(["setup-check", "--data-dir", str(Path(tmp, "unused"))]), 0)
+            result = json.loads(output.getvalue())
+            self.assertTrue(result["global_rules"]["override_file_present"])
+            self.assertFalse(result["global_rules"]["agents_file_present"])
+            self.assertEqual(result["clients_found"], {"codex": True, "claude": True, "grok": False})
+            self.assertFalse(result["login_checked"])
+            self.assertFalse(result["connection_checked"])
+            self.assertFalse(result["rules_loaded_checked"])
+            self.assertFalse(result["provider_requests_sent"])
+            self.assertEqual((home / "AGENTS.override.md").read_text(encoding="utf-8"), original)
+            self.assertFalse(Path(tmp, "unused").exists())
+            self.assertNotIn(tmp, output.getvalue())
+
+    def test_setup_check_uses_default_codex_home_when_env_is_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp, ".codex")
+            config.mkdir()
+            (config / "AGENTS.md").write_text("existing", encoding="utf-8")
+            output = io.StringIO()
+            with patch.dict(os.environ, {"CODEX_HOME": ""}), \
+                 patch.object(Path, "home", return_value=Path(tmp)), \
+                 patch.object(ai_team, "executable", return_value=None), redirect_stdout(output):
+                self.assertEqual(ai_team.main(["setup-check"]), 0)
+            self.assertTrue(json.loads(output.getvalue())["global_rules"]["agents_file_present"])
+            self.assertEqual((config / "AGENTS.md").read_text(encoding="utf-8"), "existing")
+
     def test_builds_both_adapters_without_starting_clients(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = ai_team.parser().parse_args(["serve", "--data-dir", tmp,
