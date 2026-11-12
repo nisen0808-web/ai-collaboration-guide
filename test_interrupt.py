@@ -173,6 +173,111 @@ sys.exit(m.main(["--confirm-paid", "--stdin-utf8"]))
         self.assertNotIn("private", out.getvalue())
         run.assert_called_once()
 
+    def test_second_start_failure_waits_for_first_inflight_result(self):
+        env = {"CLAUDE_MODEL": "fake", "GROK_MODEL": "fake",
+               "COLLAB_ANTHROPIC_KEY": "sk-ant-synthetic", "COLLAB_XAI_KEY": "xai-synthetic"}
+        real_start, real_wait = threading.Thread.start, app._wait_for_workers
+        started, release = threading.Event(), threading.Event()
+        starts, calls = [], []
+
+        def provider(name, *_args):
+            calls.append(name)
+            started.set()
+            if not release.wait(3):
+                raise TimeoutError("synthetic")
+            return {"status": "complete_unreviewed", "output": "first result"}
+
+        def start(worker):
+            starts.append(worker)
+            if len(starts) == 2:
+                self.assertTrue(started.wait(3))
+                raise RuntimeError("private startup detail")
+            real_start(worker)
+
+        def wait(workers):
+            release.set()
+            real_wait(workers)
+
+        out = io.StringIO()
+        try:
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "stdin", io.StringIO("task")), \
+                 mock.patch.object(app, "run_provider", side_effect=provider), \
+                 mock.patch.object(threading.Thread, "start", start), \
+                 mock.patch.object(app, "_wait_for_workers", side_effect=wait), mock.patch("sys.stdout", out):
+                code = app.main(["--confirm-paid", "--stdin-utf8"])
+            payload = json.loads(out.getvalue())
+            self.assertEqual(code, 1)
+            self.assertEqual(payload["providers"]["claude"]["output"], "first result")
+            self.assertEqual(payload["providers"]["grok"]["status"], "submission_uncertain")
+            self.assertEqual(calls, ["claude"])
+            self.assertNotIn("private", out.getvalue())
+            self.assertNotIn("synthetic", out.getvalue())
+        finally:
+            release.set()
+            if starts:
+                starts[0].join(3)
+
+    def test_interrupt_while_waiting_after_start_failure(self):
+        env = {"CLAUDE_MODEL": "fake", "GROK_MODEL": "fake",
+               "COLLAB_ANTHROPIC_KEY": "sk-ant-synthetic", "COLLAB_XAI_KEY": "xai-synthetic"}
+        real_start = threading.Thread.start
+        started, release = threading.Event(), threading.Event()
+        starts = []
+
+        def provider(*_args):
+            started.set()
+            release.wait(3)
+            return {"status": "complete_unreviewed", "output": "late"}
+
+        def start(worker):
+            starts.append(worker)
+            if len(starts) == 2:
+                self.assertTrue(started.wait(3))
+                raise RuntimeError("private")
+            real_start(worker)
+
+        out = io.StringIO()
+        try:
+            with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "stdin", io.StringIO("task")), \
+                 mock.patch.object(app, "run_provider", side_effect=provider), \
+                 mock.patch.object(threading.Thread, "start", start), \
+                 mock.patch.object(app, "_wait_for_workers", side_effect=KeyboardInterrupt), mock.patch("sys.stdout", out):
+                code = app.main(["--confirm-paid", "--stdin-utf8"])
+            self.assertEqual(code, 130)
+            self.assertEqual(json.loads(out.getvalue())["providers"]["claude"]["status"], "submission_uncertain")
+            self.assertNotIn("private", out.getvalue())
+        finally:
+            release.set()
+            if starts:
+                starts[0].join(3)
+
+    def test_start_exception_after_thread_started_preserves_both_results(self):
+        env = {"CLAUDE_MODEL": "fake", "GROK_MODEL": "fake",
+               "COLLAB_ANTHROPIC_KEY": "sk-ant-synthetic", "COLLAB_XAI_KEY": "xai-synthetic"}
+        real_start = threading.Thread.start
+        starts, calls = [], []
+
+        def start(worker):
+            starts.append(worker)
+            real_start(worker)
+            if len(starts) == 2:
+                raise RuntimeError("synthetic failure after launch")
+
+        def provider(name, *_args):
+            calls.append(name)
+            return {"status": "complete_unreviewed", "output": name}
+
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(sys, "stdin", io.StringIO("task")), \
+             mock.patch.object(app, "run_provider", side_effect=provider), \
+             mock.patch.object(threading.Thread, "start", start), mock.patch("sys.stdout", out):
+            code = app.main(["--confirm-paid", "--stdin-utf8"])
+        payload = json.loads(out.getvalue())
+        self.assertEqual(code, 1)
+        self.assertEqual(payload["providers"]["claude"]["output"], "claude")
+        self.assertEqual(payload["providers"]["grok"]["output"], "grok")
+        self.assertCountEqual(calls, ["claude", "grok"])
+
     def test_interrupt_during_second_start_preserves_completed_first_result(self):
         env = {"CLAUDE_MODEL": "fake", "GROK_MODEL": "fake",
                "COLLAB_ANTHROPIC_KEY": "sk-ant-synthetic", "COLLAB_XAI_KEY": "xai-synthetic"}

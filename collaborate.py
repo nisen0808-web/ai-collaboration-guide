@@ -425,12 +425,21 @@ def main(argv=None):
             worker = threading.Thread(target=run_and_record, args=(name, model, key), daemon=True)
             workers.append(worker)
             worker.start()
-        _wait_for_workers(workers)
     except KeyboardInterrupt:
         interrupted = True
     except Exception:
-        # Thread start/wait errors are not proof that either request did not start.
+        # A start error does not prove that the request did not start.
         start_error = True
+    if not interrupted:
+        try:
+            # Even if a later start failed, preserve results from workers that
+            # did start. is_alive() skips a thread that was never started.
+            _wait_for_workers(workers)
+        except KeyboardInterrupt:
+            interrupted = True
+        except Exception:
+            # Do not retry a failed wait or infer that remote work stopped.
+            start_error = True
     with result_lock:
         # Snapshot into a separate dictionary: a late-running daemon may still
         # record a result after interruption, but cannot alter this output.
