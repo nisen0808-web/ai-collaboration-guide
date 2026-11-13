@@ -11,7 +11,7 @@
 
 准备 Python 3.10 或更新版本、Codex，以及官方 Claude Code 和 Grok Build 命令行客户端。由使用者自行完成各客户端的账号登录，不向聊天发送密码、验证码、令牌或 API 密钥。
 
-Windows 请先运行 `python --version`，确认明确输出 Python 3.10 或更新版本；没有输出时，改用真实解释器的完整路径。PowerShell 写法为 `& "实际路径\python.exe" ai_team.py --help`，看到帮助文字后再继续。以下 `python ...` 均可作同样替换；详见[Python 入口自检](../README.md#第二步准备环境)。
+Windows 请先运行 `python --version`，确认明确输出 Python 3.10 或更新版本；没有输出时，改用真实解释器的完整路径。在 `subscription` 目录中，PowerShell 写法为 `& "实际路径\python.exe" ai_team.py --help`，看到帮助文字后再继续。以下 `python ...` 均可作同样替换；详见[Python 入口自检](../README.md#第二步准备环境)。
 
 当前以 Windows 和 Linux 为开发验证平台。**macOS 尚无受支持的卡槽恢复路径**：不确定任务占满并发位后，本工具不能释放；因此暂不推荐在 macOS 安装持久协作服务，不要通过删除账本来绕过。
 
