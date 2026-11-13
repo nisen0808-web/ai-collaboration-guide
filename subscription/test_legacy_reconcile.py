@@ -25,6 +25,13 @@ class LegacyRecoveryTests(unittest.TestCase):
         self.ticket = self.root / "ticket.json"
         self.job = "old-job"
         self.uptime = mock.patch.object(lr, "_uptime_ms", return_value=100000).start()
+        self.boot = mock.patch.object(lr.boot_evidence, "snapshot", return_value={
+            "kind": "linux_boot_id", "boot_id": "12345678-1234-1234-1234-123456789abc"}).start()
+        self.real_changed = lr.boot_evidence.changed
+        # Existing transaction/ledger tests simulate a restart. Platform marker
+        # acquisition and comparison have separate tests in test_boot_evidence.
+        self.restart = mock.patch.object(lr.boot_evidence, "changed",
+                                         side_effect=lambda saved: lr._uptime_ms() < 100000).start()
         self.addCleanup(mock.patch.stopall)
         with closing(sqlite3.connect(self.db)) as con, con:
             con.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, "
@@ -196,6 +203,113 @@ class LegacyRecoveryTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.release()
         self.assertEqual(self.rows()[0][2], "reserved")
+
+    def test_new_ticket_uses_boot_marker_without_uptime_or_wall_clock(self):
+        with mock.patch.object(lr, "_uptime_ms", side_effect=AssertionError("no uptime")), \
+             mock.patch.object(lr.time, "time", side_effect=AssertionError("no wall clock")):
+            lr.prepare("claude", self.db, self.job, self.ticket)
+            record = json.loads(self.ticket.read_text())
+            self.assertEqual(record["version"], 2)
+            self.assertEqual(record["boot_evidence"], self.boot.return_value)
+            self.assertNotIn("uptime_ms", record)
+            self.restart.side_effect = None
+            self.restart.return_value = True
+            self.release()
+        self.assertEqual(self.rows()[0][2], "operator_released")
+
+    def test_v2_release_uses_real_comparison_with_synthetic_windows_events(self):
+        old = {"record_id": 100, "time_created": "2026-01-01T00:00:00Z",
+               "start_time": "2026-01-01T00:00:00Z"}
+        # A later boot may have an earlier wall-clock timestamp.
+        new = {"record_id": 200, "time_created": "2020-01-01T00:00:00Z",
+               "start_time": "2020-01-01T00:00:00Z"}
+        self.boot.return_value = lr.boot_evidence._windows_marker(old)
+        self.restart.side_effect = self.real_changed
+        self.prepare()
+        before = self.rows()
+        with mock.patch.object(lr.boot_evidence, "_kind", return_value="windows_event12"), \
+             mock.patch.object(lr.boot_evidence, "_windows_event", side_effect=[old, old]):
+            with self.assertRaisesRegex(ValueError, "no corroborating restart"):
+                self.release()
+        self.assertEqual(self.rows(), before)
+        with mock.patch.object(lr.boot_evidence, "_kind", return_value="windows_event12"), \
+             mock.patch.object(lr.boot_evidence, "_windows_event", side_effect=[old, new]), \
+             mock.patch.object(lr, "_uptime_ms", side_effect=AssertionError("no uptime")):
+            self.release()
+        self.assertEqual(self.rows()[0][2], "operator_released")
+        self.assertEqual(self.rows()[0][1], before[0][1])
+        self.assertEqual(self.rows()[0][5], before[0][5])
+
+    def test_v2_release_missing_real_comparison_history_keeps_slot(self):
+        old = {"record_id": 100, "time_created": "2026-01-01T00:00:00Z",
+               "start_time": "2026-01-01T00:00:00Z"}
+        self.boot.return_value = lr.boot_evidence._windows_marker(old)
+        self.restart.side_effect = self.real_changed
+        self.prepare()
+        before = self.rows()
+        with mock.patch.object(lr.boot_evidence, "_kind", return_value="windows_event12"), \
+             mock.patch.object(lr.boot_evidence, "_windows_event", side_effect=ValueError("boot_evidence_unavailable")):
+            with self.assertRaisesRegex(ValueError, "boot_evidence_unavailable"):
+                self.release()
+        self.assertEqual(self.rows(), before)
+
+    def test_new_ticket_missing_or_unavailable_marker_never_falls_back(self):
+        self.prepare()
+        before = self.rows()
+        record = json.loads(self.ticket.read_text())
+        del record["boot_evidence"]
+        self.ticket.write_text(json.dumps(record))
+        self.restart.side_effect = ValueError("invalid_boot_evidence")
+        self.uptime.return_value = 1
+        with self.assertRaisesRegex(ValueError, "invalid_boot_evidence"):
+            self.release()
+        self.restart.assert_called_with(None)
+        self.assertEqual(self.rows(), before)
+        self.restart.side_effect = ValueError("boot_evidence_unavailable")
+        with self.assertRaisesRegex(ValueError, "boot_evidence_unavailable"):
+            self.release()
+        self.assertEqual(self.rows(), before)
+
+    def test_unavailable_boot_marker_does_not_write_ticket_or_change_job(self):
+        before = self.rows()
+        self.boot.side_effect = ValueError("boot_evidence_unavailable")
+        with self.assertRaisesRegex(ValueError, "boot_evidence_unavailable"):
+            self.prepare()
+        self.assertFalse(self.ticket.exists())
+        self.assertEqual(self.rows(), before)
+
+    def test_old_ticket_preserves_uptime_rule_without_using_new_markers(self):
+        self.prepare()
+        record = json.loads(self.ticket.read_text())
+        record.update(version=1, uptime_ms=100000)
+        del record["boot_evidence"]
+        self.ticket.write_text(json.dumps(record))
+        self.restart.side_effect = AssertionError("old ticket cannot use a new marker")
+        self.uptime.return_value = 100001
+        with self.assertRaisesRegex(ValueError, "no corroborating restart"):
+            self.release()
+        self.assertEqual(self.rows()[0][2], "reserved")
+        self.uptime.return_value = 50000
+        self.release()
+        self.assertEqual(self.rows()[0][2], "operator_released")
+
+    def test_fixed_reason_codes_never_include_private_details(self):
+        cases = [(ValueError("no corroborating restart"), "no_corroborating_restart"),
+                 (ValueError("ticket mismatch"), "ticket_mismatch"),
+                 (ValueError("job has a worker identity"), "job_has_a_worker_identity"),
+                 (ValueError("boot_evidence_unavailable"), "boot_evidence_unavailable"),
+                 (OSError("sensitive-path"), "local_file_error"),
+                 (sqlite3.OperationalError("sensitive-sql"), "ledger_unreadable"),
+                 (json.JSONDecodeError("sensitive", "{private}", 1), "invalid_record"),
+                 (ValueError("sensitive-data"), "not_confirmed")]
+        for error, expected in cases:
+            with self.subTest(reason=expected):
+                out = io.StringIO()
+                with mock.patch.object(lr, "prepare", side_effect=error), redirect_stderr(out):
+                    self.assertEqual(lr.main(["prepare", "claude", "ledger", "job", "ticket"]), 1)
+                self.assertIn("Reason: " + expected, out.getvalue())
+                self.assertNotIn("sensitive", out.getvalue())
+                self.assertNotIn("private", out.getvalue())
 
     @unittest.skipUnless(os.name == "nt", "Windows junction test")
     def test_windows_nested_junction_refuses_prepare_and_release(self):
@@ -465,6 +579,31 @@ class LegacyRecoveryTests(unittest.TestCase):
 
 
 class UptimeSmokeTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "nt", "Windows startup event smoke check")
+    def test_real_windows_boot_evidence_refuses_same_boot_synthetic_release(self):
+        # Only this temporary synthetic ledger is writable. No real task,
+        # restart, cancellation or provider request is involved.
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            db, ticket = root / "jobs.sqlite3", root / "ticket.json"
+            with closing(sqlite3.connect(db)) as con, con:
+                con.execute("CREATE TABLE jobs (id TEXT PRIMARY KEY, fingerprint TEXT, status TEXT, "
+                            "error TEXT, heartbeat REAL, output_file TEXT)")
+                con.execute("INSERT INTO jobs VALUES ('synthetic','key','reserved',NULL,NULL,NULL)")
+            try:
+                lr.prepare("claude", db, "synthetic", ticket)
+            except ValueError as exc:
+                if str(exc) == "boot_evidence_unavailable":
+                    self.skipTest("local Windows startup event unavailable")
+                raise
+            self.assertEqual(json.loads(ticket.read_text())["boot_evidence"]["kind"], "windows_event12")
+            with self.assertRaisesRegex(ValueError, "^no corroborating restart$"):
+                lr.release(db, ticket, same_machine_local=True, stopped_dispatchers=True,
+                           full_restart=True, cli_exited=True, updated_only=True)
+            with closing(sqlite3.connect(db)) as con:
+                self.assertEqual(con.execute("SELECT status FROM jobs").fetchone()[0], "reserved")
+                self.assertIsNone(con.execute("SELECT name FROM sqlite_master WHERE name='legacy_reconcile_audit'").fetchone())
+
     @unittest.skipUnless(os.name == "nt" or sys.platform.startswith("linux"), "unsupported platform")
     def test_real_local_uptime_is_positive_and_nondecreasing(self):
         # Read-only check of the real platform API. No reboot is attempted or proved.

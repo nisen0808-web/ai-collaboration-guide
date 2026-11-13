@@ -69,6 +69,48 @@ def executable(name: str) -> str | None:
     return _cli_path(path) if path.is_file() else None
 
 
+_PYTHON_PROBE_OUTPUT = b"ai-team-python-supported\n"
+_PYTHON_PROBE = (
+    "import sys; "
+    "sys.exit(1) if sys.version_info < (3, 10) else "
+    "sys.stdout.buffer.write(b'ai-team-python-supported\\n')"
+)
+
+
+def installation_python(selected: str | None) -> str | None:
+    """Validate a launcher without replacing its spelling with its target.
+
+    The running interpreter is the compatibility default; its path is not
+    necessarily a stable alias. Only an explicit selection needs a subprocess
+    probe, since the default interpreter is already running this installer.
+    """
+    try:
+        if selected is None:
+            if not sys.executable or sys.version_info < (3, 10):
+                return None
+            found = sys.executable
+        else:
+            if not selected:
+                return None
+            found = shutil.which(os.fspath(Path(selected).expanduser()))
+            if not found:
+                return None
+        launcher = _cli_path(found)
+        if not Path(launcher).is_file() or not os.access(launcher, os.X_OK):
+            return None
+        if selected is not None:
+            completed = subprocess.run(
+                [launcher, "-I", "-S", "-c", _PYTHON_PROBE],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=10, check=False, shell=False,
+            )
+            if completed.returncode != 0 or completed.stdout != _PYTHON_PROBE_OUTPUT:
+                return None
+        return launcher
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        return None
+
+
 def installation_executable(name: str) -> tuple[str, bool]:
     """Pin a found client or explicit path; keep an absent bare CLI name."""
     found = executable(name)
@@ -277,7 +319,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     modes = result.add_subparsers(dest="mode", required=True)
     modes.add_parser("serve", parents=[common], help="Start the local MCP server")
-    modes.add_parser("install", parents=[common], help="Add this service to Codex without changing existing entries")
+    install = modes.add_parser("install", parents=[common], help="Add this service to Codex without changing existing entries")
+    install.add_argument("--python-cli", help="Python 3.10+ launcher path or command for this installation; defaults to the running interpreter")
     modes.add_parser("setup-check", parents=[common], help="Check local prerequisites without logging in or changing configuration")
     login = modes.add_parser("login", parents=[common], help="Run a provider's official login")
     login.add_argument("provider", choices=("claude", "grok"))
@@ -326,6 +369,11 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, ensure_ascii=True, sort_keys=True))
             return 0
         if args.mode == "install":
+            python_cli = installation_python(args.python_cli)
+            if python_cli is None:
+                print("Nothing was installed or recorded. Could not validate a runnable Python 3.10+ interpreter; "
+                      "check --python-cli or the running interpreter.", file=sys.stderr)
+                return 1
             codex_cli = executable(args.codex_cli)
             if codex_cli is None:
                 print("Codex was not found. Install it or specify its path.", file=sys.stderr)
@@ -387,7 +435,7 @@ def main(argv: list[str] | None = None) -> int:
                 stream.write(name + "\n")
                 stream.flush()
                 os.fsync(stream.fileno())
-            command = [codex_cli, "mcp", "add", name, "--", str(Path(sys.executable).resolve()),
+            command = [codex_cli, "mcp", "add", name, "--", python_cli,
                        str(Path(__file__).resolve()), "serve", "--data-dir", str(data),
                        "--claude-cli", claude_cli, "--grok-cli", grok_cli,
                        "--claude-model", args.claude_model, "--grok-model", args.grok_model,

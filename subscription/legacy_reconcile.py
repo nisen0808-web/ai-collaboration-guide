@@ -20,10 +20,45 @@ import sys
 import time
 import uuid
 
+import boot_evidence
+
 _CLAUDE_ACTIVE = {"reserved", "queued", "running", "submission_uncertain"}
 _GROK_ACTIVE = {"dispatching", "queued", "running", "submission_uncertain", "not_submitted"}
 _EXIT_UNCONFIRMED = {"process_exit_unconfirmed", "process_still_running",
                      "worker_identity_unconfirmed", "operator_released"}
+
+_REASONS = {
+    "uptime unavailable", "unsupported record", "invalid job", "invalid provider",
+    "generated or hidden columns unsupported", "unsupported schema",
+    "triggers require manual investigation", "job does not hold a slot",
+    "job has a worker identity", "invalid prior result", "contradictory prior result",
+    "ledger unavailable", "ledger changed", "operator attestations required",
+    "ledger or ticket unavailable", "ticket too large", "ticket mismatch",
+    "no corroborating restart", "job changed since snapshot",
+    "unsupported audit schema", "job changed", "boot_evidence_unavailable",
+    "invalid_boot_evidence", "unsupported_recovery_platform",
+}
+
+
+def _reason_code(exc):
+    if isinstance(exc, sqlite3.Error):
+        return "ledger_unreadable"
+    if isinstance(exc, json.JSONDecodeError):
+        return "invalid_record"
+    if isinstance(exc, OSError):
+        return "local_file_error"
+    if isinstance(exc, ValueError) and str(exc) in _REASONS:
+        return str(exc).replace(" ", "_")
+    return "not_confirmed"
+
+
+def _restart_corroborated(record):
+    if record["version"] == 2:
+        # Never fall back to elapsed time or the wall clock for a new ticket.
+        return boot_evidence.changed(record.get("boot_evidence"))
+    # Existing tickets have no persistent boot marker. Preserve their original,
+    # narrower recovery window; never upgrade evidence that was not recorded.
+    return _uptime_ms() < record["uptime_ms"]
 
 
 def _uptime_ms():
@@ -156,9 +191,9 @@ def prepare(provider, db, job_id, ticket):
             raise ValueError("ledger changed")
     if not _safe_file(db) or identity != _identity(db):
         raise ValueError("ledger changed")
-    ticket_data = {"version": 1, "provider": provider, "job_id": job_id,
+    ticket_data = {"version": 2, "provider": provider, "job_id": job_id,
                    "ledger_identity": identity,
-                   "uptime_ms": _uptime_ms(),
+                   "boot_evidence": boot_evidence.snapshot(),
                    "row_hash": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
                    "operation_id": uuid.uuid4().hex}
     fd = os.open(str(ticket), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -178,14 +213,16 @@ def release(db, ticket, *, same_machine_local, stopped_dispatchers,
     if ticket.stat().st_size > 8192:
         raise ValueError("ticket too large")
     record = json.loads(ticket.read_text(encoding="utf-8"))
-    if (not isinstance(record, dict) or record.get("version") != 1 or
+    if (not isinstance(record, dict) or type(record.get("version")) is not int or
+        record["version"] not in (1, 2) or
         record.get("ledger_identity") != _identity(db) or
         not re.fullmatch(r"[a-f0-9]{32}", record.get("operation_id", "")) or
         not re.fullmatch(r"[a-f0-9]{64}", record.get("row_hash", "")) or
-        type(record.get("uptime_ms")) is not int or record["uptime_ms"] <= 0):
+        (record["version"] == 1 and
+         (type(record.get("uptime_ms")) is not int or record["uptime_ms"] <= 0))):
         raise ValueError("ticket mismatch")
-    if _uptime_ms() >= record["uptime_ms"]:
-        raise ValueError("no corroborating uptime reset")
+    if not _restart_corroborated(record):
+        raise ValueError("no corroborating restart")
     provider, job_id = record.get("provider"), record.get("job_id")
     con = sqlite3.connect(db.as_uri() + "?mode=rw", uri=True, timeout=5)
     try:
@@ -244,9 +281,12 @@ def main(argv=None):
         "confirm the specific CLI has exited. These facts are operator attestations; "
         "this program does not observe or verify them. A remote provider may still "
         "be running and its result remains uncertain. No request is resent. "
-        "Windows/Linux uptime must have decreased; this rejects same-boot recovery "
-        "but does not prove a restart, since virtual-machine rollback or a different "
-        "host can also change uptime. Other platforms are unsupported. "
+        "New tickets require changed Linux boot IDs or a later Windows Kernel-General "
+        "startup event with the original event still present. Wall-clock changes alone "
+        "cannot satisfy this check. Missing evidence is refused, not downgraded. "
+        "Old version-1 tickets still require decreased uptime and have a limited "
+        "recovery window. These are local corroboration, not proof of the attestations "
+        "or remote completion. macOS recovery is unsupported. "
         "Store the ledger and ticket in an OS-protected private directory; on "
         "Windows this command does not verify access permissions. File identity "
         "checks are not protection against a malicious account with write access."))
@@ -276,8 +316,9 @@ def main(argv=None):
                     updated_only=args.attest_new_version_only)
             print("Slot released from operator attestations. Provider outcome remains unknown; no task was resent.")
         return 0
-    except (ValueError, TypeError, OSError, sqlite3.Error, json.JSONDecodeError):
-        print("Operation not confirmed. Inspect the specified ledger and ticket; do not retry automatically.", file=sys.stderr)
+    except (ValueError, TypeError, OSError, sqlite3.Error, json.JSONDecodeError) as exc:
+        print("Operation not confirmed. Inspect the specified ledger and ticket; do not retry automatically. "
+              "Reason: " + _reason_code(exc), file=sys.stderr)
         return 1
 
 
