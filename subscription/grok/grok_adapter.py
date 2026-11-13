@@ -107,6 +107,26 @@ class GrokAdapter:
             except OSError:
                 pass  # Never recursively delete CLI-created data.
 
+    def list_models(self) -> int:
+        """Let the official client print the models this profile can select.
+
+        Uses the same isolated environment as login and tasks, so the answer
+        is for this tool's profile, not the user's everyday one. Output goes
+        straight to the caller's terminal and is never read or stored here.
+        A listed model is not proof that a task with it will succeed.
+        """
+        if not self._paths_ready():
+            raise ValueError("install official CLI and create a dedicated profile directory first")
+        home = Path(tempfile.mkdtemp(prefix="grok-models-"))
+        try:
+            return subprocess.call([str(self.cli), "models"], cwd=str(home), env=self._env(home),
+                                   stdin=subprocess.DEVNULL, shell=False)
+        finally:
+            try:
+                home.rmdir()
+            except OSError:
+                pass  # Never recursively delete CLI-created data.
+
     def submit(self, task: str, task_id: str) -> dict:
         if not isinstance(task, str) or not task.strip():
             return {"status": "not_submitted", "reason": "invalid_task"}

@@ -51,6 +51,13 @@ POLL_ERRORS = frozenset({
     "worker_request_invalid", "dispatch_interrupted", "state_write_failed",
     "operator_released",
 })
+# Errors that say a local client exit was NOT observed. The ledgers keep their
+# own copies because each must run standalone; test_shared_constants.py fails
+# when any copy drifts from this one.
+EXIT_UNCONFIRMED = frozenset({
+    "process_exit_unconfirmed", "process_still_running",
+    "worker_identity_unconfirmed", "operator_released",
+})
 # Startup diagnostics supplied by the trusted entry point, never by a provider.
 SETUP_ISSUES = frozenset({
     "cli_not_found", "invalid_configuration", "local_state_unavailable",
@@ -423,8 +430,7 @@ class Coordinator:
         if type(response.get("local_exit_confirmed")) is bool:
             # Local exit is not proof of the remote result or non-submission.
             result["local_exit_confirmed"] = (response["local_exit_confirmed"] and
-                response.get("error") not in {"operator_released", "process_exit_unconfirmed",
-                                              "process_still_running", "worker_identity_unconfirmed"} and
+                response.get("error") not in EXIT_UNCONFIRMED and
                 response.get("release_basis") != "operator_confirmed")
         if response.get("error") == "operator_released" and response.get("release_basis") == "operator_confirmed":
             # A user assertion must not be represented as observed process exit.

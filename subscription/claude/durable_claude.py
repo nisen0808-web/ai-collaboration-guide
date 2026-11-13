@@ -157,11 +157,6 @@ def _atomic_json(path: Path, value: dict) -> None:
             pass
 
 
-# A live worker rewrites its heartbeat every second, including while it waits
-# on a slow client. A much older heartbeat means no worker is updating the row.
-_OPERATOR_STALE_SECONDS = 60
-
-
 def _existing_ledger(state_dir) -> Path | None:
     """Locate an existing ledger for operator tools; never create one."""
     state = Path(_absolute(state_dir))
@@ -195,10 +190,7 @@ def blocking_jobs(state_dir) -> list[dict] | None:
                                "WHERE " + _BLOCKING_WHERE + " ORDER BY id", _BLOCKING_PARAMS).fetchall()
     finally:
         con.close()
-    now = time.time()
     return [{"job_id": row["id"], "state": row["status"],
-             "recently_active": row["heartbeat"] is not None
-                                and 0 <= now - row["heartbeat"] <= _OPERATOR_STALE_SECONDS,
              "worker_state": _worker_identity_state(row["pid"], row["identity"])}
             for row in rows]
 

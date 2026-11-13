@@ -321,6 +321,9 @@ def parser() -> argparse.ArgumentParser:
     modes.add_parser("serve", parents=[common], help="Start the local MCP server")
     install = modes.add_parser("install", parents=[common], help="Add this service to Codex without changing existing entries")
     install.add_argument("--python-cli", help="Python 3.10+ launcher path or command for this installation; defaults to the running interpreter")
+    models = modes.add_parser("models", parents=[common],
+                              help="Ask the official Grok client which models this tool's profile can select")
+    models.add_argument("provider", choices=("grok",))
     modes.add_parser("setup-check", parents=[common], help="Check local prerequisites without logging in or changing configuration")
     login = modes.add_parser("login", parents=[common], help="Run a provider's official login")
     login.add_argument("provider", choices=("claude", "grok"))
@@ -465,6 +468,26 @@ def main(argv: list[str] | None = None) -> int:
             except Exception:
                 print("Operation not confirmed. Check the original job before acting; do not retry automatically.", file=sys.stderr)
                 return 1
+        if args.mode == "models":
+            # Same profile and isolation as login and tasks; no job database
+            # is opened and no task is sent. The client prints its own list.
+            try:
+                provider = build_login_adapter(args)
+            except Exception:
+                print("Unable to prepare the model query. Check local configuration or permissions.", file=sys.stderr)
+                return 1
+            if provider is None:
+                print("Official client not found. Install it or specify its path.", file=sys.stderr)
+                return 1
+            try:
+                listed = provider.list_models()
+            except Exception:
+                listed = None
+            if type(listed) is not int or listed != 0:
+                print("The official client did not list models. Check login for this profile; "
+                      "model availability is not verified.", file=sys.stderr)
+                return 1
+            return 0
         if args.mode == "login":
             try:
                 provider = build_login_adapter(args)
