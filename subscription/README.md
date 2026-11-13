@@ -11,6 +11,8 @@
 
 准备 Python 3.10 或更新版本、Codex，以及官方 Claude Code 和 Grok Build 命令行客户端。由使用者自行完成各客户端的账号登录，不向聊天发送密码、验证码、令牌或 API 密钥。
 
+Windows 请先运行 `python --version`，确认明确输出 Python 3.10 或更新版本；没有输出时，改用真实解释器的完整路径。PowerShell 写法为 `& "实际路径\python.exe" ai_team.py --help`，看到帮助文字后再继续。以下 `python ...` 均可作同样替换；详见[Python 入口自检](../README.md#第二步准备环境)。
+
 当前以 Windows 和 Linux 为开发验证平台。**macOS 尚无受支持的卡槽恢复路径**：不确定任务占满并发位后，本工具不能释放；因此暂不推荐在 macOS 安装持久协作服务，不要通过删除账本来绕过。
 
 也可以把此仓库交给自己的 Codex，并发送以下指令：
@@ -103,7 +105,7 @@ python legacy_reconcile.py release <账本路径> <私有对账单路径> --atte
 
 程序会检查账本文件和任务记录与快照是否一致。新对账单还要求：Linux 的系统启动标识改变；Windows 出现新的 `Kernel-General` 启动事件，原事件仍在系统日志中且内容一致。它不再要求重启后的开机时长更短，也不通过“当前时间减去开机时长”推算，所以单纯调快或调慢时钟不会放行。无法读取启动证据或原事件已清除时会拒绝，不降级到时钟判断。[Windows 启动事件说明](https://learn.microsoft.com/en-us/troubleshoot/windows-server/performance/troubleshoot-unexpected-reboots-system-event-logs)、[Linux 启动标识说明](https://docs.kernel.org/admin-guide/sysctl/kernel.html#random)。
 
-旧的第 1 版对账单仍按原来的“运行时间下降”规则处理，保留其较短的操作窗口；不能事后补造启动证据。新第 2 版对账单须由新版工具处理。无论哪一版，以上都是本机辅助证据，不证明其他机器或远端任务已停止。五项声明仍由使用者负责，程序不能验证这些事实。释放后原任务保留为 `operator_released`、提交状态仍不明，不重发；已经保存的部分结果保留，之后迟到的结果可能无法入账。记录破损、仍有进程身份、账本变化、不可核验的路径或不受支持的平台会被拒绝。完整系统重启尚未在本项目的真实任务上验证；不应为对账中断正在运行的任务。
+旧的第 1 版对账单仍按原来的“运行时间下降”规则处理，保留其较短的操作窗口；不能事后补造启动证据。新第 2 版对账单须由新版工具处理。无论哪一版，以上都是本机辅助证据，不证明其他机器或远端任务已停止。五项声明仍由使用者负责，程序不能验证这些事实。释放后原任务保留为 `operator_released`、提交状态仍不明，不重发；已经保存的部分结果保留，之后迟到的结果可能无法入账。记录破损、仍有进程身份、账本变化、不可核验的路径或不受支持的平台会被拒绝。Windows 上已有一次合成账本的真实跨重启释放实测，范围见[验证记录](EVIDENCE.md)文末；真实供应商任务的跨重启释放仍未验收。不应为对账中断正在运行的任务。
 
 拒绝时会显示固定 `Reason`，不输出异常原文或私有路径：`no_corroborating_restart` 表示未取得新的启动证据；`boot_evidence_unavailable` 表示系统记录无法读取或不完整；`ticket_mismatch` 表示对账单不适用；`job_has_a_worker_identity` 应改用普通 `reconcile` 并检查进程；`ledger_unreadable` 表示账本检查失败。先查明原因，不自动重发供应商请求，也不要删除数据库。
 

@@ -53,6 +53,8 @@ Windows 键盘中断可按 [独立窗口测试说明](docs/WINDOWS_KEYBOARD_TEST
 
 需要 Python 3.10 或更新版本、网络、两家 API 的本人凭据，以及各自账号支持的模型 ID。无需安装额外 Python 包：
 
+Windows 上先运行 `python --version`，确认有明确的 Python 3.10 或更新版本输出。没有输出、打开商店或命令不存在时，改用已安装的真实解释器完整路径；`py` 也不一定存在。例如在 PowerShell 运行 `& "C:\path\to\python.exe" --version`（替换为自己的实际路径）。确认版本后，后面的 `python ...` 命令统一换成 `& "实际路径\python.exe" ...`。Codex 自带解释器也可作为候选，但位置依安装而异，须先确认文件存在并实际输出版本号。
+
 - [Anthropic API](https://platform.claude.com/docs/en/api/overview) · [定价](https://platform.claude.com/docs/en/about-claude/pricing)
 - [xAI 快速开始](https://docs.x.ai/developers/quickstart) · [模型](https://docs.x.ai/developers/models) · [定价](https://docs.x.ai/developers/pricing)
 
@@ -78,7 +80,7 @@ export GROK_MODEL='<自己账户支持的模型 ID>'
 python3 collaborate.py --ask-keys --confirm-paid
 ```
 
-程序会提示输入任务和密钥。Windows 可用 `py` 代替 `python`；请在提示时输入简短、无敏感信息的问题。
+程序会提示输入任务和密钥。请使用上面实际验证过的 Python 入口，在提示时输入简短、无敏感信息的问题。
 
 ### 方式 B：专用会话变量
 
